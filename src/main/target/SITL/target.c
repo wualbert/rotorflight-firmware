@@ -247,8 +247,8 @@ void systemInit(void) {
         exit(1);
     }
 
-    // serial can't been slow down
-    rescheduleTask(TASK_SERIAL, 1);
+    // init() calls systemInit() before tasksInitData(): rescheduleTask()
+    // cannot be used here. TASK_SERIAL keeps its default period.
 }
 
 void systemResetHard(void){
