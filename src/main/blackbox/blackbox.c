@@ -31,6 +31,7 @@
 #include "blackbox_fielddefs.h"
 #include "blackbox_io.h"
 #include "blackbox.h"
+#include "blackbox_params.h"
 
 #include "build/build_config.h"
 #include "build/debug.h"
@@ -1144,7 +1145,7 @@ static void loadSlowState(blackboxSlowState_t *slow)
         slow->pidProfile = currentPidProfile - pidProfiles(0);
         slow->rateProfile = currentControlRateProfile - controlRateProfiles(0);
         slow->armed = ARMING_FLAG(ARMED) ? 1 : 0;
-        slow->paramSeq = 0;
+        slow->paramSeq = blackboxParamsSeq();
     } else {
         // Constant, so that a change cannot force an S-frame that 4.6.0 would not write
         slow->pidProfile = 0;
@@ -1249,6 +1250,8 @@ static void blackboxStart(void)
     blackboxLastGovState = getGovernorState();
     blackboxLastRescueState = getRescueState();
     blackboxLastAirborneState = isAirborne();
+
+    blackboxParamsStart();
 
     blackboxSetState(BLACKBOX_STATE_WAIT_FOR_READY);
 }
@@ -1822,6 +1825,14 @@ static bool blackboxWriteSysinfo(void)
         BLACKBOX_PRINT_HEADER_LINE(PARAM_NAME_DEBUG_AXIS, "%d",             debugAxis);
         BLACKBOX_PRINT_HEADER_LINE("fields_mask", "%d",                     blackboxConfig()->fields);
 
+        BLACKBOX_PRINT_HEADER_CUSTOM(
+            // The parameter section: in each call, at most 64 B of one line. Nothing when blackbox_params is OFF.
+            if (blackboxParamsWriteHeader()) {
+                return true;
+            }
+            xmitState.headerIndex--;
+        );
+
         default:
             return true;
     }
@@ -2288,6 +2299,11 @@ uint8_t blackboxGetRateDenom(void)
     return blackboxPInterval;
 }
 
+uint32_t blackboxGetPInterval(void)
+{
+    return blackboxPInterval;
+}
+
 void blackboxFlush(timeUs_t currentTimeUs)
 {
     UNUSED(currentTimeUs);
@@ -2326,5 +2342,7 @@ void blackboxInit(void)
         blackboxSetState(BLACKBOX_STATE_STOPPED);
     else
         blackboxSetState(BLACKBOX_STATE_DISABLED);
+
+    blackboxParamsInit();
 }
 #endif
