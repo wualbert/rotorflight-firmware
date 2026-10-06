@@ -50,6 +50,7 @@ extern "C" {
     #include "pg/blackbox.h"
     #include "pg/feature.h"
     #include "pg/governor.h"
+    #include "pg/mixer.h"
     #include "pg/pid.h"
     #include "pg/rates.h"
     #include "pg/servos.h"
@@ -75,11 +76,20 @@ extern "C" {
 
     void blackboxWrite(uint8_t value);
     uint32_t blackboxGetPInterval(void);
+    uint32_t blackboxGetIteration(void);
+    bool blackboxIsLogRunning(void);
+    void blackboxLogCustomString(const char *ptr);
+    int32_t blackboxDeviceFreeSpace(void);
     uint8_t coreSubtaskTick(coreSubtask_e subtask);
+    uint8_t getPidUpdateCounter(void);
     int getGovernorMode(void);
     uint32_t featureRuntimeMask(void);
+    uint32_t pidParamFingerprint(void);
+    uint32_t governorParamFingerprint(void);
+    uint32_t setpointParamFingerprint(void);
     uint8_t getMotorCount(void);
     uint8_t getServoCount(void);
+    timeMs_t millis(void);
 }
 
 #include "unittest_macros.h"
@@ -87,16 +97,36 @@ extern "C" {
 
 static std::string deviceBytes;
 
+// The simulated firmware around the module
+static struct {
+    bool running;                       // blackboxIsLogRunning()
+    uint32_t iteration;                 // blackboxGetIteration()
+    uint8_t counter;                    // getPidUpdateCounter()
+    uint8_t ticks[CORE_ST_COUNT];       // coreSubtaskTick()
+    int32_t freeSpace;                  // blackboxDeviceFreeSpace()
+    timeMs_t millis;
+    int govMode;
+    uint32_t fpPid, fpGov, fpSp;
+    std::vector<std::string> events;    // blackboxLogCustomString()
+} sim;
+
+// pid_process_denom 2 (core.c)
+static const uint8_t ticksDenom2[CORE_ST_COUNT] = { 0, 0, 0, 1, 1, 1, 1, 0 };
+
 void blackboxWrite(uint8_t value) { deviceBytes.push_back(value); }
 uint32_t blackboxGetPInterval(void) { return 8; }
-uint8_t coreSubtaskTick(coreSubtask_e subtask)
-{
-    // pid_process_denom 2 (core.c)
-    static const uint8_t ticks[CORE_ST_COUNT] = { 0, 0, 0, 1, 1, 1, 1, 0 };
-    return ticks[subtask];
-}
-int getGovernorMode(void) { return 0; }
+uint32_t blackboxGetIteration(void) { return sim.iteration; }
+bool blackboxIsLogRunning(void) { return sim.running; }
+void blackboxLogCustomString(const char *ptr) { sim.events.push_back(ptr); }
+int32_t blackboxDeviceFreeSpace(void) { return sim.freeSpace; }
+uint8_t coreSubtaskTick(coreSubtask_e subtask) { return sim.ticks[subtask]; }
+uint8_t getPidUpdateCounter(void) { return sim.counter; }
+int getGovernorMode(void) { return sim.govMode; }
 uint32_t featureRuntimeMask(void) { return featureConfig()->enabledFeatures; }
+uint32_t pidParamFingerprint(void) { return sim.fpPid; }
+uint32_t governorParamFingerprint(void) { return sim.fpGov; }
+uint32_t setpointParamFingerprint(void) { return sim.fpSp; }
+timeMs_t millis(void) { return sim.millis; }
 uint8_t getMotorCount(void) { return 1; }
 uint8_t getServoCount(void) { return 4; }
 
@@ -106,8 +136,24 @@ static std::mt19937 rng(20261006);
 
 static const pgRegistry_t *trackedReg(int t) { return bbpPg[t].reg; }
 
+static void resetSim(void)
+{
+    sim.running = false;
+    sim.iteration = 0;
+    sim.counter = 0;
+    memcpy(sim.ticks, ticksDenom2, sizeof(sim.ticks));
+    sim.freeSpace = 100000;
+    sim.millis = 1000;
+    sim.govMode = 0;
+    sim.fpPid = 0x1111;
+    sim.fpGov = 0x2222;
+    sim.fpSp = 0x3333;
+    sim.events.clear();
+}
+
 static void setupConfig(uint8_t mode)
 {
+    resetSim();
     gyro.targetLooptime = 250;
     pgResetAll();
     blackboxConfigMutable()->params = mode;
@@ -900,4 +946,940 @@ TEST(BlackboxParamsTest, LongLinesFallBack)
 #else
     EXPECT_EQ(1u, d.keys.count("set@p.profile_name"));
 #endif
+}
+
+/*
+ * Journal: records in CUSTOM_STRING events
+ */
+
+struct JItem {
+    std::string key, value, old;
+};
+
+struct JRecord {
+    char type = 0;
+    uint32_t seq = 0;
+    std::string at;
+    bool pre = false;
+    bool interval = false;
+    uint32_t n0 = 0, c0 = 0, n1 = 0, c1 = 0;
+    std::map<std::string, std::string> fields;  // name=value tokens without '<'
+    std::vector<std::string> words;             // tokens without '='
+    std::vector<JItem> items;
+    int events = 0;
+};
+
+struct Journal {
+    std::vector<JRecord> records;
+    std::vector<std::string> errors;
+    int events = 0;
+    size_t longest = 0;
+};
+
+static bool parsePoint(const std::string &s, uint32_t *n, uint32_t *c)
+{
+    const size_t dot = s.find('.');
+    if (dot == std::string::npos) {
+        return false;
+    }
+    int64_t a, b;
+    if (!parseInteger(s.substr(0, dot), &a) || !parseInteger(s.substr(dot + 1), &b)) {
+        return false;
+    }
+    *n = a;
+    *c = b;
+    return true;
+}
+
+static Journal parseJournal(const std::vector<std::string> &events)
+{
+    Journal j;
+    uint32_t expectedSeq = 1;
+
+    auto finish = [&](void) {
+        if (j.records.empty()) {
+            return;
+        }
+        const JRecord &r = j.records.back();
+        if (r.type == 'C' && (!r.fields.count("n") || atoi(r.fields.at("n").c_str()) != (int)r.items.size())) {
+            j.errors.push_back("item count of record " + std::to_string(r.seq));
+        }
+    };
+
+    for (const std::string &e : events) {
+        if (e.size() < 2 || e[0] != 'P' || !strchr("CARMLQ+", e[1])) {
+            continue;   // not a journal event
+        }
+        j.events++;
+        j.longest = std::max(j.longest, e.size());
+        if (e.size() > BBP_EVENT_MAX) {
+            j.errors.push_back("event longer than 128: " + e);
+        }
+        const size_t star = e.rfind('*');
+        if (star == std::string::npos || star + 3 != e.size()) {
+            j.errors.push_back("no CRC: " + e);
+            continue;
+        }
+        char crc[3];
+        snprintf(crc, sizeof(crc), "%02X", crc8_dvb_s2_update(0, e.data(), star));
+        if (e.substr(star + 1) != crc) {
+            j.errors.push_back("bad CRC: " + e);
+        }
+        const std::vector<std::string> tokens = split(e.substr(2, star - 2), ' ');
+        if (tokens.size() < 2) {
+            j.errors.push_back("short event: " + e);
+            continue;
+        }
+        for (char ch : tokens[0]) {
+            if (!isxdigit(ch) || isupper(ch)) {
+                j.errors.push_back("seq not lowercase hex: " + e);
+            }
+        }
+        const uint32_t seq = strtoul(tokens[0].c_str(), NULL, 16);
+
+        JRecord *r;
+        if (e[1] == '+') {
+            if (j.records.empty() || j.records.back().seq != seq || j.records.back().at != tokens[1]) {
+                j.errors.push_back("continuation without its record: " + e);
+                continue;
+            }
+            r = &j.records.back();
+        } else {
+            finish();
+            if (seq != expectedSeq) {
+                j.errors.push_back("seq " + std::to_string(seq) + " instead of " + std::to_string(expectedSeq));
+            }
+            expectedSeq = seq + 1;
+            j.records.push_back(JRecord());
+            r = &j.records.back();
+            r->type = e[1];
+            r->seq = seq;
+            r->at = tokens[1];
+            if (r->at == "p") {
+                r->pre = true;
+            } else {
+                const size_t tilde = r->at.find('~');
+                bool ok;
+                if (tilde == std::string::npos) {
+                    ok = parsePoint(r->at, &r->n1, &r->c1);
+                    r->n0 = r->n1;
+                    r->c0 = r->c1;
+                } else {
+                    r->interval = true;
+                    ok = parsePoint(r->at.substr(0, tilde), &r->n0, &r->c0) && parsePoint(r->at.substr(tilde + 1), &r->n1, &r->c1);
+                    if (ok && (r->n0 > r->n1 || (r->n0 == r->n1 && r->c0 >= r->c1))) {
+                        j.errors.push_back("empty interval: " + e);
+                    }
+                }
+                if (!ok) {
+                    j.errors.push_back("bad point: " + e);
+                }
+            }
+        }
+        r->events++;
+        for (size_t i = 2; i < tokens.size(); i++) {
+            const std::string &tok = tokens[i];
+            const size_t eq = tok.find('=');
+            const size_t lt = tok.find('<');
+            if (eq == std::string::npos) {
+                r->words.push_back(tok);
+            } else if (lt == std::string::npos || r->type != 'C') {
+                const std::string name = tok.substr(0, eq);
+                if (name == "pgs" && r->fields.count("pgs")) {
+                    r->fields[name] += "," + tok.substr(eq + 1);     // an L list that continues
+                } else {
+                    r->fields[name] = tok.substr(eq + 1);
+                }
+            } else {
+                r->items.push_back({ tok.substr(0, eq), tok.substr(eq + 1, lt - eq - 1), tok.substr(lt + 1) });
+            }
+        }
+    }
+    finish();
+    return j;
+}
+
+static const JRecord *findRecord(const Journal &j, char type, const std::string &src = "")
+{
+    for (const JRecord &r : j.records) {
+        if (r.type == type && (src.empty() || (r.fields.count("s") && r.fields.at("s") == src))) {
+            return &r;
+        }
+    }
+    return NULL;
+}
+
+static int countRecords(const Journal &j, char type, const std::string &src = "")
+{
+    int n = 0;
+    for (const JRecord &r : j.records) {
+        n += r.type == type && (src.empty() || (r.fields.count("s") && r.fields.at("s").compare(0, src.size(), src) == 0));
+    }
+    return n;
+}
+
+// The bytes that an item gives: group, offset and the value as bytes. False when the key is not known.
+static bool applyItemText(std::vector<std::vector<uint8_t>> &bytes, const std::string &key, const std::string &text, std::string *error)
+{
+    if (key == "pid_profile" || key == "rate_profile") {
+        const int t = bbpTrackedIndex(PG_SYSTEM_CONFIG);
+        const unsigned offset = (key == "pid_profile") ? offsetof(systemConfig_t, pidProfileIndex) : offsetof(systemConfig_t, activeRateProfile);
+        bytes[t][offset] = atoi(text.c_str());
+        return true;
+    }
+    if (key.compare(0, 3, "pg.") == 0) {
+        const size_t plus = key.find('+');
+        const int t = bbpTrackedIndex(atoi(key.substr(3, plus - 3).c_str()));
+        const unsigned offset = atoi(key.substr(plus + 1).c_str());
+        if (t < 0 || text.size() % 2 || text.size() / 2 > BBP_RAW_ITEM_BYTES || offset + text.size() / 2 > bytes[t].size()) {
+            *error = "bad raw item " + key;
+            return false;
+        }
+        for (size_t i = 0; i < text.size() / 2; i++) {
+            bytes[t][offset + i] = strtoul(text.substr(2 * i, 2).c_str(), NULL, 16);
+        }
+        return true;
+    }
+    if (key.compare(0, 3, "el.") == 0) {
+        const std::vector<std::string> parts = split(key, '.');
+        const bbpElementKind_t *kind = NULL;
+        for (int k = 0; k < BBP_ELEMENT_KINDS; k++) {
+            if (parts[1] == bbpElementKinds[k].name) {
+                kind = &bbpElementKinds[k];
+            }
+        }
+        const int t = kind ? bbpTrackedIndex(kind->pgn) : -1;
+        const std::vector<std::string> fields = split(text, ',');
+        if (t < 0 || (int)fields.size() != kind->fieldCount) {
+            *error = "bad element item " + key + "=" + text;
+            return false;
+        }
+        const unsigned base = kind->indexed ? atoi(parts[2].c_str()) * pgElementSize(trackedReg(t)) : 0;
+        for (int f = 0; f < kind->fieldCount; f++) {
+            int64_t number;
+            if (!parseInteger(fields[f], &number, kind->fields[f].type == BBP_F_HEX32 ? 16 : 10)) {
+                *error = "bad field " + key;
+                return false;
+            }
+            storeNumber(&bytes[t][base + kind->fields[f].offset], fieldSize(&kind->fields[f]), number);
+        }
+        return true;
+    }
+
+    // [p<k>.|r<k>.]<name>[[<i>]]
+    std::string name = key;
+    int section = MASTER_VALUE;
+    unsigned instance = 0;
+    if ((key[0] == 'p' || key[0] == 'r') && isdigit(key[1]) && key.find('.') != std::string::npos) {
+        section = (key[0] == 'p') ? PROFILE_VALUE : PROFILE_RATE_VALUE;
+        instance = atoi(key.c_str() + 1);
+        name = key.substr(key.find('.') + 1);
+    }
+    int element = -1;
+    const size_t bracket = name.find('[');
+    if (bracket != std::string::npos) {
+        element = atoi(name.c_str() + bracket + 1);
+        name = name.substr(0, bracket);
+    }
+    const clivalue_t *v = findEntry(name, section);
+    const int t = v ? bbpTrackedIndex(v->pgn) : -1;
+    if (t < 0) {
+        *error = "unknown item " + key;
+        return false;
+    }
+    unsigned offset = instance * pgElementSize(trackedReg(t)) + v->offset;
+    if (element >= 0) {
+        int64_t number;
+        if ((v->type & VALUE_MODE_MASK) != MODE_ARRAY || element >= v->config.array.length || !parseInteger(text, &number)) {
+            *error = "bad array item " + key + "=" + text;
+            return false;
+        }
+        storeNumber(&bytes[t][offset + element * typeSizeOf(v)], typeSizeOf(v), number);
+        return true;
+    }
+    if (!parseValue(v, text, &bytes[t][offset])) {
+        *error = "bad value " + key + "=" + text;
+        return false;
+    }
+    return true;
+}
+
+// Apply the C records to the state of the header: the old value of each item must be the state before it
+static void applyJournal(Decoded &d, const Journal &j, std::vector<std::string> &errors)
+{
+    for (const JRecord &r : j.records) {
+        if (r.type != 'C') {
+            continue;
+        }
+        for (const JItem &it : r.items) {
+            std::string error;
+            if (!r.pre) {
+                std::vector<std::vector<uint8_t>> check = d.bytes;
+                if (!applyItemText(check, it.key, it.old, &error)) {
+                    errors.push_back(error);
+                    continue;
+                }
+                if (check != d.bytes) {
+                    errors.push_back("record " + std::to_string(r.seq) + ": old value of " + it.key + " is not the state");
+                }
+            }
+            if (!applyItemText(d.bytes, it.key, it.value, &error)) {
+                errors.push_back(error);
+            }
+        }
+    }
+}
+
+static void expectStateIsLive(const Decoded &d)
+{
+    for (int t = 0; t < BBP_TRACKED; t++) {
+        const pgRegistry_t *reg = trackedReg(t);
+        if (!reg) {
+            continue;
+        }
+        int wrong = 0;
+        for (unsigned i = 0; i < pgSize(reg); i++) {
+            if (d.bytes[t][i] != reg->address[i]) {
+                if (wrong++ < 5) {
+                    ADD_FAILURE() << "pg " << pgN(reg) << "+" << i << ": " << (int)d.bytes[t][i] << " instead of " << (int)reg->address[i];
+                }
+            }
+        }
+        EXPECT_EQ(0, wrong) << "pg " << pgN(reg);
+    }
+}
+
+static void expectNoErrors(const Journal &j)
+{
+    for (const std::string &e : j.errors) {
+        ADD_FAILURE() << e;
+    }
+}
+
+// The header states: one header line or part in each iteration, and the comparison with the previous log
+static std::string runHeader(int changeAtCall = -1, void (*change)(void) = NULL)
+{
+    deviceBytes.clear();
+    sim.running = false;
+    sim.iteration = 0;
+    blackboxHeaderBudget = 0;
+    blackboxParamsStart();
+    for (int call = 0; call < 100000; call++) {
+        blackboxParamsHeaderTick();
+        if (call == changeAtCall && change) {
+            change();
+        }
+        blackboxHeaderBudget = MIN(blackboxHeaderBudget + 64, 256);
+        if (blackboxParamsWriteHeader()) {
+            break;
+        }
+    }
+    return deviceBytes;
+}
+
+// T0: the log is RUNNING
+static void runningLog(void)
+{
+    sim.running = true;
+    sim.iteration = 0;
+    blackboxParamsRunning();
+}
+
+// One logged frame: the PID task after the frame, then the next iteration
+static void logFrame(void)
+{
+    sim.counter = 0;
+    blackboxParamsAfterFrame();
+    sim.iteration++;
+}
+
+// Frames until no event for 64 frames
+static void drainJournal(void)
+{
+    size_t count = sim.events.size();
+    for (int quiet = 0; quiet < 64; ) {
+        logFrame();
+        if (sim.events.size() == count) {
+            quiet++;
+        } else {
+            quiet = 0;
+            count = sim.events.size();
+        }
+    }
+}
+
+static std::string hexText(uint32_t value)
+{
+    char text[16];
+    snprintf(text, sizeof(text), "%x", value);
+    return text;
+}
+
+static void mutateRandomBytes(int count)
+{
+    for (int i = 0; i < count; i++) {
+        int t;
+        do {
+            t = rng() % BBP_TRACKED;
+        } while (!trackedReg(t) || bbpTrackedPgs[t].pgn == PG_BLACKBOX_CONFIG);
+        trackedReg(t)->address[rng() % pgSize(trackedReg(t))] = rng();
+    }
+    // Bytes after the NUL of a string: raw items
+    if (rng() % 2) {
+        tidyStrings();
+    }
+}
+
+TEST(BlackboxParamsJournalTest, OffWritesNoRecord)
+{
+    setupConfig(BLACKBOX_PARAMS_OFF);
+    runHeader();
+    runningLog();
+    blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+    pidProfilesMutable(0)->pid[0].P += 1;
+    blackboxParamsOpEnd();
+    drainJournal();
+    EXPECT_EQ(0u, sim.events.size());
+    EXPECT_EQ(0u, blackboxParamsSeq());
+}
+
+// Random changes in operations: the header and the records give every byte at the end, and each old value is
+// the state before the record
+TEST(BlackboxParamsJournalTest, RandomChangesAreExact)
+{
+    int records = 0, events = 0;
+    size_t longest = 0;
+    for (int run = 0; run < 20; run++) {
+        setupConfig(BLACKBOX_PARAMS_FULL);
+        Decoded d = decodeHeader(runHeader());
+        expectExact(d);
+        runningLog();
+        for (int i = 0; i < 400; i++) {
+            if (rng() % 4 == 0) {
+                const uint16_t cmd = 100 + rng() % 100;
+                sim.counter = rng() % 2;
+                blackboxParamsOpBegin(BBP_SRC_MSP, cmd);
+                mutateRandomBytes(1 + rng() % 6);
+                if (rng() % 3 == 0) {
+                    blackboxParamsApplied(BBP_LOADER_PID, rng() % PID_PROFILE_COUNT);
+                }
+                blackboxParamsOpEnd();
+                EXPECT_EQ(sim.iteration, sim.iteration);
+            }
+            logFrame();
+        }
+        drainJournal();
+        const Journal j = parseJournal(sim.events);
+        expectNoErrors(j);
+        std::vector<std::string> errors;
+        applyJournal(d, j, errors);
+        for (const std::string &e : errors) {
+            ADD_FAILURE() << e;
+        }
+        expectStateIsLive(d);
+        // Every change is of an operation, at an exact point
+        for (const JRecord &r : j.records) {
+            if (r.type == 'C') {
+                EXPECT_EQ('m', r.fields.at("s")[0]) << r.seq;
+                EXPECT_FALSE(r.interval) << r.seq;
+            }
+        }
+        EXPECT_EQ(blackboxParamsSeq(), j.records.empty() ? 0 : j.records.back().seq);
+        records += j.records.size();
+        events += j.events;
+        longest = std::max(longest, j.longest);
+        if (HasFailure()) {
+            break;
+        }
+    }
+    printf("random changes: %d records in %d events, longest event %zu chars\n", records, events, longest);
+}
+
+// A change of a whole PID profile: one record in more than one event
+TEST(BlackboxParamsJournalTest, ContinuationEvents)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    Decoded d = decodeHeader(runHeader());
+    runningLog();
+    blackboxParamsOpBegin(BBP_SRC_MSP, 95);
+    fillRandom((uint8_t *)pidProfilesMutable(3), sizeof(pidProfile_t));
+    tidyStrings();
+    blackboxParamsOpEnd();
+    drainJournal();
+
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    const JRecord *r = findRecord(j, 'C', "m.95");
+    ASSERT_NE(nullptr, r);
+    EXPECT_GT(r->events, 3);
+    EXPECT_EQ(atoi(r->fields.at("n").c_str()), (int)r->items.size());
+    for (const std::string &e : sim.events) {
+        EXPECT_LE(e.size(), (size_t)BBP_EVENT_MAX);
+    }
+    std::vector<std::string> errors;
+    applyJournal(d, j, errors);
+    EXPECT_TRUE(errors.empty());
+    expectStateIsLive(d);
+    printf("one PID profile: %zu items in %d events\n", r->items.size(), r->events);
+}
+
+// A bad CRC is found
+TEST(BlackboxParamsJournalTest, CrcFindsAChange)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+    pidProfilesMutable(0)->pid[0].P += 1;
+    blackboxParamsOpEnd();
+    drainJournal();
+    std::vector<std::string> events = sim.events;
+    EXPECT_TRUE(parseJournal(events).errors.empty());
+    for (std::string &e : events) {
+        if (e.compare(0, 2, "PC") == 0) {
+            e[e.find('=') + 1] ^= 1;
+        }
+    }
+    EXPECT_FALSE(parseJournal(events).errors.empty());
+}
+
+// MSP, then changePidProfile, then the loaders of pidLoadProfile: one source, and the change before the 'A'
+TEST(BlackboxParamsJournalTest, NestedOperations)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    for (int i = 0; i < 10; i++) {
+        logFrame();
+    }
+    sim.counter = 1;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 210);                // MSP_SELECT_SETTING
+    blackboxParamsOpBegin(BBP_SRC_PROFILE, 2);              // changePidProfile(2)
+    systemConfigMutable()->pidProfileIndex = 2;
+    currentPidProfile = pidProfilesMutable(2);
+    pidProfilesMutable(2)->governor.gain += 1;              // governorInitProfile: validateAndFixGovernorProfile
+    blackboxParamsApplied(BBP_LOADER_GOVERNOR, 2);
+    blackboxParamsApplied(BBP_LOADER_RESCUE, 2);
+    blackboxParamsApplied(BBP_LOADER_PID, 2);
+    blackboxParamsOpEnd();
+    blackboxParamsOpEnd();
+    drainJournal();
+
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    std::string order;
+    for (const JRecord &r : j.records) {
+        if (r.type == 'C' || r.type == 'A') {
+            order += std::string(1, r.type) + (r.type == 'C' ? r.fields.at("s") : r.words[0]) + " ";
+            EXPECT_EQ("10.1", r.at);
+        }
+    }
+    // The governor change before A gov, the profile index (SYSTEM_CONFIG is in the pid region) before A pid
+    EXPECT_EQ("Cm.210 Agov/2 Arsc/2 Cm.210 Apid/2 ", order);
+    const JRecord *first = findRecord(j, 'C', "m.210");
+    ASSERT_NE(nullptr, first);
+    EXPECT_EQ("p2.gov_gain", first->items[0].key);
+    EXPECT_EQ(0, countRecords(j, 'C', "p"));
+    const JRecord *a = findRecord(j, 'A');
+    ASSERT_NE(nullptr, a);
+    EXPECT_EQ(hexText(sim.fpGov), std::string(a->fields.at("fp")).erase(0, 4));
+}
+
+// A write that no hook saw, before an operation: its own 'u' record with an interval; the operation keeps its
+// exact point
+TEST(BlackboxParamsJournalTest, PreCaptureOfAnUnhookedWrite)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    Decoded d = decodeHeader(runHeader());
+    runningLog();
+    sim.iteration = 90;
+    sim.counter = 1;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 1);                  // verifies every group at 90.1
+    blackboxParamsOpEnd();
+    sim.iteration = 100;
+    controlRateProfilesMutable(1)->cyclic_ring += 7;        // the unhooked write
+    sim.iteration = 105;
+    sim.counter = 0;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 202);
+    pidProfilesMutable(0)->pid[2].P += 3;
+    blackboxParamsOpEnd();
+    drainJournal();
+
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    const JRecord *u = findRecord(j, 'C', "u");
+    const JRecord *m = findRecord(j, 'C', "m.202");
+    ASSERT_NE(nullptr, u);
+    ASSERT_NE(nullptr, m);
+    EXPECT_EQ("90.1~105.0", u->at);
+    EXPECT_EQ(1u, u->items.size());
+    EXPECT_EQ("r1.cyclic_ring", u->items[0].key);
+    EXPECT_EQ("105.0", m->at);
+    EXPECT_EQ(1u, m->items.size());
+    EXPECT_EQ("p0.yaw_p_gain", m->items[0].key);
+    EXPECT_LT(u->seq, m->seq);
+    std::vector<std::string> errors;
+    applyJournal(d, j, errors);
+    EXPECT_TRUE(errors.empty());
+    expectStateIsLive(d);
+}
+
+// The ring overflows: the items that fit, then 'L', then a 'y' record for each group, with an interval from
+// the last verified point. A later operation on another group keeps its exact point.
+TEST(BlackboxParamsJournalTest, RingOverflowGivesLostThenResync)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    Decoded d = decodeHeader(runHeader());
+    runningLog();
+    sim.iteration = 50;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 1);                  // verifies every group at 50.0
+    blackboxParamsOpEnd();
+
+    // A slow device: nothing drains. Operations change more than the ring takes.
+    sim.freeSpace = 0;
+    for (int i = 0; i < 100; i++) {
+        sim.iteration = 60 + i;
+        blackboxParamsOpBegin(BBP_SRC_MSP, 95);
+        pidProfilesMutable(i % PID_PROFILE_COUNT)->pid[i % 3].P += 1;
+        controlRateProfilesMutable(i % CONTROL_RATE_PROFILE_COUNT)->rcRates[i % 3] += 1;
+        blackboxParamsOpEnd();
+    }
+    sim.iteration = 170;
+    blackboxParamsAfterFrame();     // 'L'
+
+    // The device takes events again. When the first group is back, an operation on another group.
+    sim.freeSpace = 100000;
+    while (sim.iteration < 1000 && std::none_of(sim.events.begin(), sim.events.end(),
+        [](const std::string &e) { return e.find(" s=y ") != std::string::npos; })) {
+        logFrame();
+    }
+    const uint32_t opIteration = sim.iteration;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 211);
+    governorConfigMutable()->gov_spoolup_time += 1;
+    blackboxParamsOpEnd();
+    drainJournal();
+
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    const JRecord *lost = findRecord(j, 'L');
+    ASSERT_NE(nullptr, lost);
+    EXPECT_NE(std::string::npos, ("," + lost->fields.at("pgs") + ",").find("," + std::to_string(PG_PID_PROFILE) + ","));
+    EXPECT_GE(countRecords(j, 'C', "y"), 1);
+    // The first operation that did not fit verified the groups in its pre-capture, at the point of 'L'
+    EXPECT_EQ(lost->at, std::to_string(lost->n1) + ".0");
+    EXPECT_GT(lost->n1, 60u);
+    for (const JRecord &r : j.records) {
+        if (r.type == 'C' && r.fields.at("s") == "y") {
+            EXPECT_TRUE(r.interval);
+            EXPECT_EQ(lost->at + "~", r.at.substr(0, lost->at.size() + 1)) << "the interval starts at the last verified point";
+            EXPECT_GT(r.seq, lost->seq);
+        }
+    }
+    const JRecord *gov = findRecord(j, 'C', "m.211");
+    if (!gov || getenv("BBP_EVENTS")) {
+        for (const std::string &e : sim.events) {
+            printf("%s\n", e.substr(0, 100).c_str());
+        }
+    }
+    ASSERT_NE(nullptr, gov);
+    EXPECT_EQ(std::to_string(opIteration) + ".0", gov->at);
+    ASSERT_EQ(1u, gov->items.size());
+    EXPECT_EQ("gov_spoolup_time", gov->items[0].key);
+    EXPECT_EQ("60.0", findRecord(j, 'C', "m.95")->at);
+    EXPECT_GT(countRecords(j, 'C', "m.95"), 10);
+
+    // The state is exact again after the resync
+    std::vector<std::string> errors;
+    Decoded state = d;
+    applyJournal(state, j, errors);
+    expectStateIsLive(state);
+
+    // The end record
+    sim.millis = 5000;
+    EXPECT_FALSE(blackboxParamsHoldLogEnd());
+    blackboxParamsEnd();
+    const Journal end = parseJournal(sim.events);
+    const JRecord *q = findRecord(end, 'Q');
+    ASSERT_NE(nullptr, q);
+    EXPECT_EQ("0", q->fields.at("unsent"));
+    EXPECT_EQ("0", q->fields.at("lostrec"));
+    printf("overflow: %d records, %d y records, L pgs=%s, Q lostrec=%s\n", (int)j.records.size(),
+        countRecords(j, 'C', "y"), lost->fields.at("pgs").c_str(), q->fields.at("lostrec").c_str());
+}
+
+// Before T0 every stamp is 'p'. Changes between two logs are 'v' records. After the CLI, 'M shadow-reset'.
+TEST(BlackboxParamsJournalTest, BeforeT0AndBetweenLogs)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    // A change during the header
+    Decoded d = decodeHeader(runHeader(100, [](void) {
+        blackboxParamsOpBegin(BBP_SRC_MSP, 7);
+        pidProfilesMutable(1)->pid[0].I += 2;
+        blackboxParamsOpEnd();
+    }));
+    runningLog();
+    drainJournal();
+    Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    const JRecord *pre = findRecord(j, 'C', "m.7");
+    ASSERT_NE(nullptr, pre);
+    EXPECT_TRUE(pre->pre);
+    const JRecord *rt = findRecord(j, 'R');
+    ASSERT_NE(nullptr, rt);
+    EXPECT_TRUE(rt->pre);
+    EXPECT_EQ(5u, rt->fields.size());
+    std::vector<std::string> errors;
+    applyJournal(d, j, errors);
+    expectStateIsLive(d);
+
+    // The end of the log, changes between the logs (no log: no operation records), the next log
+    blackboxParamsStop();
+    blackboxParamsOpBegin(BBP_SRC_MSP, 8);
+    pidProfilesMutable(4)->pid[1].D += 5;
+    servoParamsMutable(2)->rate += 3;
+    blackboxParamsOpEnd();
+    sim.events.clear();
+    Decoded d2 = decodeHeader(runHeader());
+    expectExact(d2);
+    runningLog();
+    drainJournal();
+    j = parseJournal(sim.events);
+    expectNoErrors(j);
+    EXPECT_EQ(2, countRecords(j, 'C', "v"));
+    for (const JRecord &r : j.records) {
+        if (r.type == 'C') {
+            EXPECT_EQ("v", r.fields.at("s"));
+            EXPECT_TRUE(r.pre);
+        }
+    }
+    EXPECT_EQ(0, countRecords(j, 'M'));
+
+    // The CLI overwrote the shadow
+    blackboxParamsStop();
+    blackboxParamsShadowLost();
+    pidProfilesMutable(4)->pid[1].D += 5;
+    sim.events.clear();
+    runHeader();
+    runningLog();
+    drainJournal();
+    j = parseJournal(sim.events);
+    expectNoErrors(j);
+    const JRecord *m = findRecord(j, 'M');
+    ASSERT_NE(nullptr, m);
+    EXPECT_EQ("shadow-reset", m->words.at(0));
+    EXPECT_EQ(1u, m->seq);
+    EXPECT_EQ(0, countRecords(j, 'C'));
+}
+
+// The stamp rule against a model of taskMainPidLoop() (core.c) for pid_process_denom 1-16: an operation
+// between two ticks, and which subtasks of which frame used the new value
+TEST(BlackboxParamsJournalTest, StampRuleForEveryDenominator)
+{
+    // The tick of each subtask (pos, sp, pid, mix, mot, fupd, bb, flush) in core.c
+    static const uint8_t schedule[8][CORE_ST_COUNT] = {
+        { 0, 0, 0, 0, 0, 0, 0, 0 },     // 1
+        { 0, 0, 0, 1, 1, 1, 1, 0 },     // 2
+        { 0, 0, 0, 0, 1, 2, 1, 2 },     // 3
+        { 0, 0, 0, 1, 1, 2, 2, 3 },     // 4
+        { 0, 0, 0, 1, 2, 2, 3, 4 },     // 5
+        { 0, 0, 1, 2, 3, 3, 4, 5 },     // 6
+        { 0, 0, 1, 2, 3, 4, 5, 6 },     // 7
+        { 0, 1, 2, 3, 4, 5, 6, 7 },     // 8 and more
+    };
+    int checked = 0;
+    for (int denom = 1; denom <= 16; denom++) {
+        const uint8_t *ticks = schedule[MIN(denom, 8) - 1];
+        const int b = ticks[CORE_ST_BLACKBOX];
+        for (int c = 0; c < denom; c++) {
+            setupConfig(BLACKBOX_PARAMS_FULL);
+            memcpy(sim.ticks, ticks, sizeof(sim.ticks));
+            runHeader();
+            runningLog();
+            // Cycle 0 logged frame 0, cycle 1 logs frame 1. The write comes after ticks 0..c-1 of cycle 1.
+            sim.iteration = (c > b) ? 2 : 1;
+            sim.counter = c;
+            blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+            pidProfilesMutable(0)->pid[0].P += 1;
+            blackboxParamsOpEnd();
+            drainJournal();
+            const Journal j = parseJournal(sim.events);
+            const JRecord *r = findRecord(j, 'C', "m.1");
+            ASSERT_NE(nullptr, r);
+            ASSERT_FALSE(r->interval);
+            for (int cycle = 0; cycle < 3; cycle++) {
+                for (int s = 0; s < CORE_ST_COUNT; s++) {
+                    // A subtask after blackboxUpdate in its cycle acts on the next frame, or not at all (flush)
+                    if (ticks[s] > b) {
+                        continue;
+                    }
+                    const bool used = cycle > 1 || (cycle == 1 && ticks[s] >= c);
+                    const bool stamped = (uint32_t)cycle > r->n1 || ((uint32_t)cycle == r->n1 && ticks[s] >= (int)r->c1);
+                    EXPECT_EQ(used, stamped) << "denom " << denom << " c " << c << " cycle " << cycle << " subtask " << s << " at " << r->at;
+                    checked++;
+                }
+            }
+            EXPECT_LE((int)r->c1, b);
+        }
+    }
+    printf("stamp rule: %d subtask runs checked for pid_process_denom 1-16\n", checked);
+}
+
+// The scan: a write that no hook saw is found. Its interval starts where the previous pass of the group started.
+TEST(BlackboxParamsJournalTest, ScanVerifiedPointIsTheStartOfThePass)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    // Scan steps of one pass over all groups
+    int steps = 0;
+    for (int t = 0; t < BBP_TRACKED; t++) {
+        if (trackedReg(t)) {
+            steps += (pgSize(trackedReg(t)) + BBP_SCAN_BYTES - 1) / BBP_SCAN_BYTES;
+        }
+    }
+    // Pass 1 of PID_PROFILE (group 0) starts after frame 0: point 1.0. Pass 2 starts after frame 'steps'.
+    for (int i = 0; i < steps + 3; i++) {
+        logFrame();
+    }
+    // A write in a part of the PID profiles that pass 2 has not compared yet
+    pidProfilesMutable(PID_PROFILE_COUNT - 1)->pid[0].P += 1;
+    const int chunk = ((PID_PROFILE_COUNT - 1) * sizeof(pidProfile_t) + offsetof(pidProfile_t, pid)) / BBP_SCAN_BYTES;
+    ASSERT_GE(chunk, 3);
+    for (int i = 0; i < steps + 3; i++) {
+        logFrame();
+    }
+    drainJournal();
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    const JRecord *u = findRecord(j, 'C', "u");
+    ASSERT_NE(nullptr, u);
+    EXPECT_TRUE(u->interval);
+    // Not the end of pass 1, and not the start of pass 2: the start of pass 1, the last complete pass
+    EXPECT_EQ("1.0~" + std::to_string(steps + 1 + chunk) + ".0", u->at);
+    printf("scan: one pass is %d logged iterations, write found in %s\n", steps, u->at.c_str());
+}
+
+// Runtime values: an 'R' record with an interval when a polled value changes
+TEST(BlackboxParamsJournalTest, RuntimePoll)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    for (int i = 0; i < 40; i++) {
+        logFrame();
+    }
+    sim.fpGov = 0xabcdef12;
+    for (int i = 0; i < 40; i++) {
+        logFrame();
+    }
+    drainJournal();
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    ASSERT_EQ(2, countRecords(j, 'R'));
+    const JRecord &r = j.records.back();
+    EXPECT_EQ('R', r.type);
+    EXPECT_EQ("abcdef12", r.fields.at("fp.gov"));
+    EXPECT_EQ(1u, r.fields.size());
+    EXPECT_TRUE(r.interval);
+    EXPECT_EQ(r.n0 + 20, r.n1);
+}
+
+// LOG_END waits for the records, for at most 100 ms
+TEST(BlackboxParamsJournalTest, HoldLogEnd)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    EXPECT_TRUE(blackboxParamsHoldLogEnd());    // the 'R' record of T0
+    drainJournal();
+    EXPECT_FALSE(blackboxParamsHoldLogEnd());
+    sim.freeSpace = 0;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+    pidProfilesMutable(0)->pid[0].P += 1;
+    blackboxParamsOpEnd();
+    for (int ms = 0; ms < 100; ms += 10) {
+        EXPECT_TRUE(blackboxParamsHoldLogEnd());
+        logFrame();
+        sim.millis += 10;
+    }
+    EXPECT_FALSE(blackboxParamsHoldLogEnd());
+    blackboxParamsEnd();
+    const Journal j = parseJournal(sim.events);
+    const JRecord *q = findRecord(j, 'Q');
+    ASSERT_NE(nullptr, q);
+    EXPECT_EQ("1", q->fields.at("unsent"));
+}
+
+// The time of one operation: the pre-capture and the post-capture of all groups, with one change
+TEST(BlackboxParamsJournalTest, OperationTime)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    double best = 1e9, bestEmpty = 1e9, bestScan = 1e9, bestDrain = 1e9;
+    for (int run = 0; run < 2000; run++) {
+        auto start = std::chrono::steady_clock::now();
+        blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+        pidProfilesMutable(run % PID_PROFILE_COUNT)->pid[0].P += 1;
+        blackboxParamsOpEnd();
+        best = std::min(best, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
+
+        start = std::chrono::steady_clock::now();
+        blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+        blackboxParamsOpEnd();
+        bestEmpty = std::min(bestEmpty, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
+
+        // A drain step with an event, and one without
+        const size_t before = sim.events.size();
+        start = std::chrono::steady_clock::now();
+        blackboxParamsAfterFrame();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        if (sim.events.size() > before) {
+            bestDrain = std::min(bestDrain, us);
+        }
+        sim.iteration++;
+        drainJournal();
+        start = std::chrono::steady_clock::now();
+        blackboxParamsAfterFrame();
+        bestScan = std::min(bestScan, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
+        sim.iteration++;
+        sim.events.clear();
+    }
+    printf("on this computer: operation with one change %.2f us, operation without a change %.2f us, "
+        "PID task with an event %.2f us, idle PID task step %.3f us\n", best, bestEmpty, bestDrain, bestScan);
+}
+
+// Markers, and a loader outside an operation
+TEST(BlackboxParamsJournalTest, MarkersAndLoaderOutsideAnOperation)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    sim.iteration = 30;
+    blackboxParamsMarker(BBP_MARKER_EESAVE, 71230, 0);
+    blackboxParamsMarker(BBP_MARKER_EELOAD, 0, 0);
+    blackboxParamsMarker(BBP_MARKER_ESCPARAM, 12, 0xdeadbeef);
+    mixerConfigMutable()->swash_ring += 1;
+    blackboxParamsApplied(BBP_LOADER_MIXER, -1);
+    drainJournal();
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    std::vector<std::string> words;
+    for (const JRecord &r : j.records) {
+        if (r.type == 'M') {
+            words.push_back(r.words[0] + (r.fields.count("us") ? " us=" + r.fields.at("us") : "") +
+                (r.fields.count("fnv") ? " n=" + r.fields.at("n") + " fnv=" + r.fields.at("fnv") : ""));
+        }
+    }
+    EXPECT_EQ(std::vector<std::string>({ "eesave us=71230", "eeload", "escparam n=12 fnv=deadbeef" }), words);
+    // Outside an operation the loader is its own operation (source l): a write before it is not its write
+    const JRecord *u = findRecord(j, 'C', "u");
+    ASSERT_NE(nullptr, u);
+    EXPECT_EQ("swash_ring", u->items.at(0).key);
+    EXPECT_TRUE(u->interval);
+    const JRecord &a = j.records.back();
+    EXPECT_EQ('A', a.type);
+    EXPECT_EQ("mix", a.words.at(0));
+    EXPECT_EQ("30.0", a.at);
+    EXPECT_LT(u->seq, a.seq);
 }
