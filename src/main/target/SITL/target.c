@@ -51,6 +51,10 @@ const timerHardware_t timerHardware[1]; // unused
 
 #include "pg/rx.h"
 #include "pg/motor.h"
+#include "pg/serial_pinconfig.h"
+
+#include "drivers/adc.h"
+#include "sensors/adcinternal.h"
 
 #include "rx/rx.h"
 
@@ -255,6 +259,14 @@ void systemResetHard(void){
     exit(0);
 }
 
+// drivers/system.c is not in the SITL build. A reboot (CLI "reboot", MSP_REBOOT)
+// stops the SITL process: start it again to "boot".
+void systemReset(int reason)
+{
+    printf("[system]Reset reason %d\n", reason);
+    systemResetHard();
+}
+
 void timerInit(void) {
     printf("[timer]Init...\n");
 }
@@ -391,35 +403,30 @@ int timeval_sub(struct timespec *result, struct timespec *x, struct timespec *y)
 
 
 // PWM part
-pwmOutputPort_t motors[MAX_SUPPORTED_MOTORS];
-static pwmOutputPort_t servos[MAX_SUPPORTED_SERVOS];
+FAST_DATA_ZERO_INIT pwmOutputPort_t motors[MAX_SUPPORTED_MOTORS];
 
-// real value to send
-static int16_t motorsPwm[MAX_SUPPORTED_MOTORS];
-static int16_t servosPwm[MAX_SUPPORTED_SERVOS];
-static int16_t idlePulse;
-
-void servoDevInit(const servoDevConfig_t *servoConfig) {
-    UNUSED(servoConfig);
-    for (uint8_t servoIndex = 0; servoIndex < MAX_SUPPORTED_SERVOS; servoIndex++) {
-        servos[servoIndex].enabled = true;
-    }
-}
+// Motor outputs to the simulator: throttle 0..1 (bidirectional -1..1)
+static float motorsOut[MAX_SUPPORTED_MOTORS];
 
 static motorDevice_t motorPwmDevice; // Forward
 
-pwmOutputPort_t *pwmGetMotors(void) {
+pwmOutputPort_t *pwmGetMotors(void)
+{
     return motors;
 }
 
-static float pwmConvertFromExternal(uint16_t externalValue)
-{
-    return (float)externalValue;
-}
+// flight/servos.c: the SITL has no timers, so servoInit() finds no servo and
+// does not call this. A channel that it configures writes to a dummy register.
+static timCCR_t dummyCCR[MAX_SUPPORTED_SERVOS];
 
-static uint16_t pwmConvertToExternal(float motorValue)
+void pwmOutConfig(timerChannel_t *channel, const timerHardware_t *timerHardware, uint32_t hz, uint16_t period, uint16_t value, uint8_t inversion)
 {
-    return (uint16_t)motorValue;
+    UNUSED(hz);
+    UNUSED(period);
+    UNUSED(inversion);
+    channel->ccr = &dummyCCR[0];
+    channel->tim = timerHardware ? timerHardware->tim : NULL;
+    *channel->ccr = value;
 }
 
 static void pwmDisableMotors(void)
@@ -430,18 +437,21 @@ static void pwmDisableMotors(void)
 static bool pwmEnableMotors(void)
 {
     motorPwmDevice.enabled = true;
-
     return true;
 }
 
-static void pwmWriteMotor(uint8_t index, float value)
+static void pwmWriteMotor(uint8_t index, uint8_t mode, float value)
 {
-    motorsPwm[index] = value - idlePulse;
+    UNUSED(mode);
+    if (index < MAX_SUPPORTED_MOTORS) {
+        motorsOut[index] = value;
+    }
 }
 
 static void pwmWriteMotorInt(uint8_t index, uint16_t value)
 {
-    pwmWriteMotor(index, (float)value);
+    UNUSED(index);
+    UNUSED(value);
 }
 
 static void pwmShutdownPulsesForAllMotors(void)
@@ -449,7 +459,8 @@ static void pwmShutdownPulsesForAllMotors(void)
     motorPwmDevice.enabled = false;
 }
 
-bool pwmIsMotorEnabled(uint8_t index) {
+static bool pwmIsMotorEnabled(uint8_t index)
+{
     return motors[index].enabled;
 }
 
@@ -458,49 +469,37 @@ static void pwmCompleteMotorUpdate(void)
     // send to simulator
     // for gazebo8 ArduCopterPlugin remap, normal range = [0.0, 1.0], 3D rang = [-1.0, 1.0]
 
-    double outScale = 1000.0;
-
-    pwmPkt.motor_speed[3] = motorsPwm[0] / outScale;
-    pwmPkt.motor_speed[0] = motorsPwm[1] / outScale;
-    pwmPkt.motor_speed[1] = motorsPwm[2] / outScale;
-    pwmPkt.motor_speed[2] = motorsPwm[3] / outScale;
+    pwmPkt.motor_speed[3] = motorsOut[0];
+    pwmPkt.motor_speed[0] = motorsOut[1];
+    pwmPkt.motor_speed[1] = motorsOut[2];
+    pwmPkt.motor_speed[2] = motorsOut[3];
 
     // get one "fdm_packet" can only send one "servo_packet"!!
     if (pthread_mutex_trylock(&updateLock) != 0) return;
     udpSend(&pwmLink, &pwmPkt, sizeof(servo_packet));
-//    printf("[pwm]%u:%u,%u,%u,%u\n", idlePulse, motorsPwm[0], motorsPwm[1], motorsPwm[2], motorsPwm[3]);
-}
-
-void pwmWriteServo(uint8_t index, float value) {
-    servosPwm[index] = value;
 }
 
 static motorDevice_t motorPwmDevice = {
     .vTable = {
         .postInit = motorPostInitNull,
-        .convertExternalToMotor = pwmConvertFromExternal,
-        .convertMotorToExternal = pwmConvertToExternal,
         .enable = pwmEnableMotors,
         .disable = pwmDisableMotors,
-        .isMotorEnabled = pwmIsMotorEnabled,
+        .shutdown = pwmShutdownPulsesForAllMotors,
         .updateStart = motorUpdateStartNull,
+        .updateComplete = pwmCompleteMotorUpdate,
         .write = pwmWriteMotor,
         .writeInt = pwmWriteMotorInt,
-        .updateComplete = pwmCompleteMotorUpdate,
-        .shutdown = pwmShutdownPulsesForAllMotors,
+        .isMotorEnabled = pwmIsMotorEnabled,
     }
 };
 
-motorDevice_t *motorPwmDevInit(const motorDevConfig_t *motorConfig, uint16_t _idlePulse, uint8_t motorCount, bool useUnsyncedPwm)
+motorDevice_t *motorPwmDevInit(const motorDevConfig_t *motorConfig, uint8_t motorCount)
 {
     UNUSED(motorConfig);
-    UNUSED(useUnsyncedPwm);
 
     if (motorCount > 4) {
         return NULL;
     }
-
-    idlePulse = _idlePulse;
 
     for (int motorIndex = 0; motorIndex < MAX_SUPPORTED_MOTORS && motorIndex < motorCount; motorIndex++) {
         motors[motorIndex].enabled = true;
@@ -516,6 +515,24 @@ motorDevice_t *motorPwmDevInit(const motorDevConfig_t *motorConfig, uint16_t _id
 uint16_t adcGetChannel(uint8_t channel) {
     UNUSED(channel);
     return 0;
+}
+
+// drivers/adc.c and the internal ADC are not in the SITL build
+bool adcIsEnabled(uint8_t channel)
+{
+    UNUSED(channel);
+    return false;
+}
+
+int16_t getCoreTemperatureCelsius(void)
+{
+    return 0;
+}
+
+// drivers/serial_pinconfig.c is not in the SITL build: no UART pins
+void pgResetFn_serialPinConfig(serialPinConfig_t *serialPinConfig)
+{
+    UNUSED(serialPinConfig);
 }
 
 // stack part
@@ -593,6 +610,17 @@ void IOConfigGPIO(IO_t io, ioConfig_t cfg)
     UNUSED(cfg);
     printf("IOConfigGPIO\n");
 }
+
+void IOConfigGPIOAF(IO_t io, ioConfig_t cfg, uint8_t af)
+{
+    UNUSED(io);
+    UNUSED(cfg);
+    UNUSED(af);
+    printf("IOConfigGPIOAF\n");
+}
+
+// UID_BASE (target.h): the same values as U_ID_0..U_ID_2
+const uint32_t sitlUniqueId[3] = { U_ID_0, U_ID_1, U_ID_2 };
 
 void spektrumBind(rxConfig_t *rxConfig)
 {
