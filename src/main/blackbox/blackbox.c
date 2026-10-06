@@ -1124,6 +1124,17 @@ static void writeSlowFrame(void)
     }
 }
 
+/*
+ * The 100 ms wait before the header is for a UART logger (OpenLog). The flash and the SD card are ready when
+ * the state machine gets to SEND_HEADER. A log with the parameter section skips the wait for them, because
+ * the longer header makes the time from arming to the first frame longer.
+ */
+static bool blackboxSkipUartWait(void)
+{
+    return blackboxSlowParamFields &&
+        (blackboxConfig()->device == BLACKBOX_DEVICE_FLASH || blackboxConfig()->device == BLACKBOX_DEVICE_SDCARD);
+}
+
 static int blackboxSlowFieldCount(void)
 {
     return blackboxSlowParamFields ? ARRAYLEN(blackboxSlowFields) : BLACKBOX_SLOW_FIELD_COUNT_BASIC;
@@ -2135,7 +2146,7 @@ void blackboxUpdate(timeUs_t currentTimeUs)
          * Once the UART has had time to init, transmit the header in chunks so we don't overflow its transmit
          * buffer, overflow the OpenLog's buffer, or keep the main loop busy for too long.
          */
-        if (millis() > xmitState.u.startTime + 100) {
+        if (blackboxSkipUartWait() || millis() > xmitState.u.startTime + 100) {
             if (blackboxDeviceReserveBufferSpace(BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION) == BLACKBOX_RESERVE_SUCCESS) {
                 for (int i = 0; i < BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION && blackboxHeader[xmitState.headerIndex] != '\0'; i++, xmitState.headerIndex++) {
                     blackboxWrite(blackboxHeader[xmitState.headerIndex]);
