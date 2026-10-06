@@ -238,23 +238,24 @@ void tcpWrite(serialPort_t *instance, uint8_t ch)
 }
 
 // TCP thread only. Moves the TX ring buffer to the dyad stream. Without a
-// client the data is lost, as on a UART with nothing connected.
+// client the data stays in the buffer (as before): the blackbox opens its
+// port when a log starts, and the log header must wait for the client that
+// connects then. Writers check serialTxBytesFree().
 void tcpDataOut(tcpPort_t *instance)
 {
     tcpPort_t *s = (tcpPort_t *)instance;
+    if (s->conn == NULL) return;
     pthread_mutex_lock(&s->txLock);
 
-    if (s->conn != NULL) {
-        if (s->port.txBufferHead < s->port.txBufferTail) {
-            // send data till end of buffer
-            int chunk = s->port.txBufferSize - s->port.txBufferTail;
-            dyad_write(s->conn, (const void *)&s->port.txBuffer[s->port.txBufferTail], chunk);
-            s->port.txBufferTail = 0;
-        }
-        int chunk = s->port.txBufferHead - s->port.txBufferTail;
-        if (chunk)
-            dyad_write(s->conn, (const void*)&s->port.txBuffer[s->port.txBufferTail], chunk);
+    if (s->port.txBufferHead < s->port.txBufferTail) {
+        // send data till end of buffer
+        int chunk = s->port.txBufferSize - s->port.txBufferTail;
+        dyad_write(s->conn, (const void *)&s->port.txBuffer[s->port.txBufferTail], chunk);
+        s->port.txBufferTail = 0;
     }
+    int chunk = s->port.txBufferHead - s->port.txBufferTail;
+    if (chunk)
+        dyad_write(s->conn, (const void*)&s->port.txBuffer[s->port.txBufferTail], chunk);
     s->port.txBufferTail = s->port.txBufferHead;
 
     pthread_mutex_unlock(&s->txLock);
