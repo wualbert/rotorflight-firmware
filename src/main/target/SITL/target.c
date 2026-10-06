@@ -57,6 +57,7 @@ const timerHardware_t timerHardware[1]; // unused
 #include "sensors/adcinternal.h"
 
 #include "rx/rx.h"
+#include "rx/msp.h"
 
 #include "dyad.h"
 #include "target/SITL/udplink.h"
@@ -68,9 +69,10 @@ static servo_packet pwmPkt;
 
 static struct timespec start_time;
 static double simRate = 1.0;
-static pthread_t tcpWorker, udpWorker;
+static pthread_t tcpWorker, udpWorker, udpRcWorker;
 static bool workerRunning = true;
-static udpLink_t stateLink, pwmLink;
+static udpLink_t stateLink, pwmLink, rcLink;
+static rc_packet rcPkt;
 static pthread_mutex_t updateLock;
 static pthread_mutex_t mainLoopLock;
 
@@ -209,6 +211,27 @@ static void* udpThread(void* data) {
     return NULL;
 }
 
+// RC input: UDP port 9004, rc_packet (target.h), the same as Betaflight SITL.
+// The channels go to the MSP receiver (FEATURE_RX_MSP), as MSP_SET_RAW_RC does.
+static void* udpRcThread(void* data) {
+    UNUSED(data);
+    bool received = false;
+
+    while (workerRunning) {
+        const int n = udpRecv(&rcLink, &rcPkt, sizeof(rc_packet), 100);
+        if (n == sizeof(rc_packet)) {
+            if (!received) {
+                printf("[SITL] RC packets received on UDP %d\n", rcLink.port);
+                received = true;
+            }
+            rxMspFrameReceive(rcPkt.channels, SIMULATOR_MAX_RC_CHANNELS);
+        }
+    }
+
+    printf("udpRcThread end!!\n");
+    return NULL;
+}
+
 static void* tcpThread(void* data) {
     UNUSED(data);
 
@@ -265,6 +288,15 @@ void systemInit(void) {
         exit(1);
     }
 
+    ret = udpInit(&rcLink, NULL, 9004, true);
+    printf("start UDP server for RC input...%d\n", ret);
+
+    ret = pthread_create(&udpRcWorker, NULL, udpRcThread, NULL);
+    if (ret != 0) {
+        printf("Create udpRcWorker error!\n");
+        exit(1);
+    }
+
     // init() calls systemInit() before tasksInitData(): rescheduleTask()
     // cannot be used here. TASK_SERIAL keeps its default period.
 }
@@ -274,6 +306,7 @@ void systemResetHard(void){
     workerRunning = false;
     pthread_join(tcpWorker, NULL);
     pthread_join(udpWorker, NULL);
+    pthread_join(udpRcWorker, NULL);
     exit(0);
 }
 

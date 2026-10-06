@@ -252,6 +252,13 @@ typedef struct {
     float motor_speed[4];   // normal: [0.0, 1.0], 3D: [-1.0, 1.0]
 } servo_packet;
 
+#define SIMULATOR_MAX_RC_CHANNELS 16
+
+typedef struct {
+    double timestamp;                               // in seconds
+    uint16_t channels[SIMULATOR_MAX_RC_CHANNELS];   // RC channel value: 1000..2000 us
+} rc_packet;
+
 void FLASH_Unlock(void);
 void FLASH_Lock(void);
 FLASH_Status FLASH_ErasePage(uintptr_t Page_Address);
