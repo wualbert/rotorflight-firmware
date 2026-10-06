@@ -8,6 +8,17 @@ INCLUDE_DIRS    := $(filter-out $(SRC_DIR)/common,$(INCLUDE_DIRS)) \
 
 TARGET_FLAGS    = -D$(TARGET) -iquote $(SRC_DIR)/common
 
+# Upstream CI does not build SITL. SITL leaves out many features (DSHOT, LED
+# strip, telemetry), so some parameters, variables and functions are unused.
+# The ARM targets compile with -fsingle-precision-constant. SITL does not
+# (lib/main/dyad and the SITL clock need double constants), so a few debug
+# expressions such as "x * 1e6" in flight/pid.c promote float to double.
+# Show these as warnings, not errors.
+TARGET_FLAGS   += -Wno-error=unused-parameter \
+                  -Wno-error=unused-variable \
+                  -Wno-error=unused-function \
+                  -Wno-error=double-promotion
+
 MCU_COMMON_SRC  := $(ROOT)/lib/main/dyad/dyad.c
 
 #Flags
