@@ -8,10 +8,12 @@ and tools/sitl/capture.py. Steps:
   1. Wait until only the arm switch blocks arming. Set a roll rate error:
      roll stick --roll-stick us (setpoint) with zero gyro, so that the
      P term is P gain x (setpoint - gyro) all the time.
-  2. Arm (AUX1 high), wait --armed1 s.
+  2. Arm (AUX1 high; if LOAD blocks the arm, switch low and try again),
+     wait --armed1 s.
   3. While armed: read the PID gains, write roll P = --new-p (MSP_SET_PID_TUNING,
      applied at once by pidLoadProfile()), read them back. Wait --after-change s.
-  4. Disarm, wait --gap s (less than the grace period), re-arm: the log
+  4. Wait until the real-time load is low (else LOAD can block the re-arm),
+     disarm, wait --gap s (less than the grace period), re-arm: the log
      continues, without a new header.
   5. Wait --armed2 s, disarm, wait grace + --tail s so that the blackbox
      writes LOG_END. Restore the stick.
@@ -76,6 +78,44 @@ def wait_armed(fc, armed, timeout=5.0):
                      % ('arm' if armed else 'disarm', timeout, st['arming_disabled_by']))
 
 
+def arm(fc, ctl, timeout=4.0):
+    """Arm with the AUX1 switch. Return the arming flags of the failed attempts.
+
+    A host stall of about 0.1 ms or more in the real-time tasks sets LOAD
+    (fc/core.c: max real-time load > 75 %), and the flag stays for a few
+    seconds. If LOAD is set when the switch goes high, the FC sets ARM_SWITCH
+    and does not arm. Then put the switch low and try again."""
+    deadline = time.monotonic() + timeout
+    failed = []
+    while time.monotonic() < deadline:
+        st = fc.status()
+        if [f for f in st['arming_disabled_by'] if f != 'ARM_SWITCH']:
+            time.sleep(0.02)
+            continue
+        ctl({'rc': {str(AUX1): 1900}})
+        until = min(deadline, time.monotonic() + 0.3)
+        while time.monotonic() < until:
+            st = fc.status()
+            if st['armed']:
+                return failed
+            time.sleep(0.02)
+        failed.append(st['arming_disabled_by'])
+        ctl({'rc': {str(AUX1): 1000}})
+        time.sleep(0.05)
+    raise SystemExit('scenario: the SITL did not arm in %.1f s, failed attempts %s, arming disabled by %s'
+                     % (timeout, failed, fc.status()['arming_disabled_by']))
+
+
+def wait_low_load(fc, timeout=10.0, limit=600):
+    """Wait until the max real-time load is below the LOAD limit (750), so
+    that a re-arm soon after the next disarm is not blocked. The FC updates
+    the LOAD flag only while disarmed, so read the load. Return the wait, s."""
+    t0 = time.monotonic()
+    while fc.status()['max_realtime_load'] > limit and time.monotonic() - t0 < timeout:
+        time.sleep(0.05)
+    return round(time.monotonic() - t0, 2)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--msp-port', type=int, default=5761)
@@ -117,9 +157,7 @@ def main():
 
         # 2. arm
         tl.add('arm_cmd')
-        ctl({'rc': {str(AUX1): 1900}})
-        wait_armed(fc, True)
-        tl.add('armed')
+        tl.add('armed', failed_attempts=arm(fc, ctl))
         time.sleep(a.armed1)
 
         # 3. change roll P while armed
@@ -136,15 +174,17 @@ def main():
         time.sleep(a.after_change)
 
         # 4. disarm, re-arm inside the grace period
-        tl.add('disarm_cmd')
+        tl.add('disarm_cmd', load_wait_s=wait_low_load(fc))
         ctl({'rc': {str(AUX1): 1000}})
         wait_armed(fc, False)
-        tl.add('disarmed')
+        disarmed = tl.add('disarmed')
         time.sleep(a.gap)
         tl.add('rearm_cmd')
-        ctl({'rc': {str(AUX1): 1900}})
-        wait_armed(fc, True)
-        tl.add('rearmed')
+        rearm_failed = arm(fc, ctl, timeout=max(0.5, grace - a.gap - 1.0))
+        rearmed = tl.add('rearmed', failed_attempts=rearm_failed)
+        if rearmed['t_monotonic'] - disarmed['t_monotonic'] >= grace:
+            raise SystemExit('scenario: the re-arm came %.2f s after the disarm, not inside the %d s grace period'
+                             % (rearmed['t_monotonic'] - disarmed['t_monotonic'], grace))
 
         # 5. disarm, wait for the end of the grace period (LOG_END)
         time.sleep(a.armed2)

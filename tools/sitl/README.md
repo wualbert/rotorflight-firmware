@@ -93,10 +93,12 @@ mixer. Gyro 8 kHz (the fake gyro gets the default rate of `gyroSetSampleRate`),
 | `RX_FAILSAFE` | no RC input except `MSP_SET_RAW_RC` | RC on UDP 9004, `sim_feed.py` |
 | `ANGLE`, `CALIBRATING` without IMU data | no FDM packets | `sim_feed.py` |
 | arm switch does nothing | no ARM mode range | `configure.py` |
+| `ACC_CALIBRATION` after the configuration reboot (1 run in 4) | `configure.py` read the flags before the first `updateArmingStatus()` (RX task), so a fresh `eeprom.bin` showed no `ACC_CALIBRATION` and the calibration was skipped | `configure.py` waits until `BOOT_GRACE_TIME` clears (that call clears it) |
+| `LOAD` comes and goes for seconds (61 % of 175 status reads in 45 s idle with the Mac busy, load average 7) | max real-time load > 75 % (`fc/core.c`): a host stall of 0.1 ms or more in the gyro/PID section. The scheduler only zeroes the CPU and system loads for `SIMULATOR_BUILD`. An arm switch during `LOAD` sets `ARM_SWITCH` | `scenario_regrace.py` arms through `arm()`: switch low and try again; the timeline has the failed attempts |
 
 Transient after boot: `BOOT_GRACE_TIME` (3 s), `BST` (1 s RX recovery after
 the first valid RC frame). `scenario_regrace.py` waits until only
-`ARM_SWITCH` may be set.
+`ARM_SWITCH` may be set. Transient at any time when the host is busy: `LOAD`.
 
 ## Scenario `regrace`
 
@@ -116,7 +118,8 @@ then DISARM and LOG_END.
 
 - Loop timing: the main loop sleeps 50 us after each `scheduler()` call (about
   80 us in the VM). The 8 kHz gyro task cannot keep up; the PID loop runs at
-  920..990 Hz instead of 1 kHz (measured from the logs of 5 runs). In the
+  870..990 Hz instead of 1 kHz (measured from the logs of 8 runs; slower when
+  the host is busy). In the
   500 Hz logs, 90..98 % of the frame intervals are 1.9..2.5 ms, 0.5..3 % are
   4..10 ms and 1..6 per run are 10..44 ms (host load matters). These are late
   PID loops, not lost frames: `loopIteration` has no gaps.

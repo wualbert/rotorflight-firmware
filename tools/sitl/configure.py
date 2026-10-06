@@ -58,7 +58,18 @@ def main():
     with MSP(a.host, a.port, timeout=3.0, connect_timeout=20.0) as fc:
         out['fc'] = dict(fc.api_version(), **fc.fc_version())
 
-        st = fc.status()
+        # The arming flags are only valid after the first updateArmingStatus()
+        # (fc/core.c, from the RX task). Until then a fresh eeprom.bin shows no
+        # ACC_CALIBRATION. updateArmingStatus() also clears BOOT_GRACE_TIME
+        # (3 s after boot), so wait for that.
+        deadline = time.monotonic() + 15
+        while True:
+            st = fc.status()
+            if 'BOOT_GRACE_TIME' not in st['arming_disabled_by']:
+                break
+            if time.monotonic() > deadline:
+                sys.exit('configure: BOOT_GRACE_TIME did not clear (is sim_feed running?)')
+            time.sleep(0.2)
         if st['arming_disable_flags'] & ACC_CALIBRATION_FLAG:
             fc.acc_calibration()
             deadline = time.monotonic() + 10
