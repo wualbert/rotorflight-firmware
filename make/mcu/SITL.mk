@@ -1,6 +1,12 @@
 
-INCLUDE_DIRS    := $(INCLUDE_DIRS) \
+# src/main/common has headers (time.h, ctype.h) that have the names of C
+# library headers. With -I, they also hide the host C library headers:
+# <pthread.h> then includes common/time.h and misses clockid_t. With -iquote,
+# only #include "..." searches src/main/common, and <...> finds the host headers.
+INCLUDE_DIRS    := $(filter-out $(SRC_DIR)/common,$(INCLUDE_DIRS)) \
                    $(ROOT)/lib/main/dyad
+
+TARGET_FLAGS    = -D$(TARGET) -iquote $(SRC_DIR)/common
 
 MCU_COMMON_SRC  := $(ROOT)/lib/main/dyad/dyad.c
 
@@ -10,12 +16,14 @@ DEVICE_FLAGS    =
 LD_SCRIPT       = src/main/target/SITL/pg.ld
 STARTUP_SRC     =
 
-TARGET_FLAGS    = -D$(TARGET)
 MCU_FLASH_SIZE  := 2048
 
 ARM_SDK_PREFIX  =
 
+# common/string_light.c: the host C library has these functions, and with
+#   -iquote <ctype.h> is the host header (glibc macros, not common/ctype.h).
 MCU_EXCLUDES = \
+            common/string_light.c \
             drivers/adc.c \
             drivers/bus_i2c.c \
             drivers/bus_i2c_config.c \
