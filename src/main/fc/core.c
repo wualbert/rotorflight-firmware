@@ -1080,6 +1080,12 @@ uint8_t coreSubtaskTick(coreSubtask_e subtask)
     return subtaskTick[subtask];
 }
 
+// The ticks of this PID cycle that have run, between two ticks
+uint8_t getPidUpdateCounter(void)
+{
+    return pidUpdateCounter;
+}
+
 timeUs_t getLastDisarmTimeUs(void)
 {
     return lastDisarmTimeUs;

@@ -77,4 +77,5 @@ void resetTryingToArm(void);
 void subTaskTelemetryPollSensors(timeUs_t currentTimeUs);
 
 uint8_t coreSubtaskTick(coreSubtask_e subtask);
+uint8_t getPidUpdateCounter(void);
 
