@@ -45,6 +45,7 @@ const timerHardware_t timerHardware[1]; // unused
 
 #include "drivers/accgyro/accgyro_fake.h"
 #include "flight/imu.h"
+#include "sensors/gyro.h"
 
 #include "config/feature.h"
 #include "config/config.h"
@@ -89,6 +90,29 @@ int lockMainPID(void) {
 void sendMotorUpdate(void) {
     udpSend(&pwmLink, &pwmPkt, sizeof(servo_packet));
 }
+
+// sensors/gyro.c skips the calibration of a fake gyro: it sets
+// calibration.running = false. But 4.6 sees a calibration as complete only
+// with calibration.cycles > 0 (isGyroSensorCalibrationComplete()), so
+// ARMING_DISABLED_CALIBRATING stays set and the SITL cannot arm. Mark a
+// skipped calibration as done (zero offset, as the skip intends).
+static void completeSkippedGyroCalibration(void)
+{
+    gyroSensor_t *sensors[] = {
+        &gyro.gyroSensor1,
+#ifdef USE_MULTI_GYRO
+        &gyro.gyroSensor2,
+#endif
+    };
+
+    for (unsigned i = 0; i < ARRAYLEN(sensors); i++) {
+        gyroCalibration_t *cal = &sensors[i]->calibration;
+        if (sensors[i]->gyroDev.gyroHardware == GYRO_FAKE && !cal->running && cal->cycles == 0) {
+            cal->cycles = 1;
+        }
+    }
+}
+
 void updateState(const fdm_packet* pkt) {
     static double last_timestamp = 0; // in seconds
     static uint64_t last_realtime = 0; // in uS
@@ -129,6 +153,7 @@ void updateState(const fdm_packet* pkt) {
     y = constrain(-pkt->imu_angular_velocity_rpy[1] * GYRO_SCALE * RAD2DEG, -32767, 32767);
     z = constrain(-pkt->imu_angular_velocity_rpy[2] * GYRO_SCALE * RAD2DEG, -32767, 32767);
     fakeGyroSet(fakeGyroDev, x, y, z);
+    completeSkippedGyroCalibration();
 //    printf("[gyr]%lf,%lf,%lf\n", pkt->imu_angular_velocity_rpy[0], pkt->imu_angular_velocity_rpy[1], pkt->imu_angular_velocity_rpy[2]);
 
 #if !defined(USE_IMU_CALC)
