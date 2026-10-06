@@ -22,6 +22,8 @@
 
 #include "platform.h"
 
+#include "blackbox/blackbox_params.h"
+
 #include "build/build_config.h"
 #include "build/debug.h"
 
@@ -715,6 +717,8 @@ void INIT_CODE pidLoadProfile(const pidProfile_t *pidProfile)
     acroTrainerInit(pidProfile);
 #endif
     rescueInitProfile(pidProfile);
+
+    blackboxParamsApplied(BBP_LOADER_PID, pidProfile - pidProfiles(0));
 }
 
 // FNV-1 of the runtime parameters that pidLoadProfile() writes. No filter and no loop state.

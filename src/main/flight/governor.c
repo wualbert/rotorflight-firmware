@@ -22,6 +22,8 @@
 
 #include "platform.h"
 
+#include "blackbox/blackbox_params.h"
+
 #include "build/build_config.h"
 #include "build/debug.h"
 
@@ -1625,6 +1627,8 @@ void INIT_CODE governorInitProfile(const pidProfile_t *pidProfile)
         gov.motorRPMGlitchLimit = (gov.fullHeadSpeed / gov.mainGearRatio) * GOV_HS_GLITCH_LIMIT;
 
         govInitTTA(pidProfile);
+
+        blackboxParamsApplied(BBP_LOADER_GOVERNOR, pidProfile - pidProfiles(0));
     }
 }
 

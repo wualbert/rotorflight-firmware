@@ -21,6 +21,8 @@
 
 #include "platform.h"
 
+#include "blackbox/blackbox_params.h"
+
 #include "build/debug.h"
 
 #include "common/axis.h"
@@ -244,6 +246,8 @@ INIT_CODE void setpointInitProfile(void)
         sp.ringLimit[FD_ROLL]  = 2000;
         sp.ringLimit[FD_PITCH] = 2000;
     }
+
+    blackboxParamsApplied(BBP_LOADER_SETPOINT, currentControlRateProfile - controlRateProfiles(0));
 }
 
 // FNV-1 of the runtime parameters that setpointInitProfile() writes. No filter and no loop state.

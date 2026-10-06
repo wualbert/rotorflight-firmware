@@ -172,6 +172,8 @@ static void activateConfig(void)
 #endif
 
     initActiveBoxIds();
+
+    blackboxParamsApplied(BBP_LOADER_ACTIVATE, -1);
 }
 
 static void adjustFilterLimit(uint16_t *parm, uint16_t maxValue, uint16_t resetValue)

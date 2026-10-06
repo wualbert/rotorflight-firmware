@@ -4,6 +4,7 @@
 #include "system_response.include/system_response.h"
 
 extern "C" {
+#include "blackbox/blackbox_params.h"
 #include "flight/setpoint.h"
 #include "pg/rates.h"
 #include "pg/rx.h"
@@ -32,6 +33,8 @@ class MockInterface {
 
 extern "C" {
 float getRcDeflection(int axis) { return g_mock->getRcDeflection(axis); }
+void blackboxParamsApplied(bbpLoader_e, int) {}
+uint32_t fnv_update_words(uint32_t hash, const void *, uint32_t) { return hash; }
 }
 
 // Mocked variables
