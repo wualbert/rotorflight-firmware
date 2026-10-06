@@ -25,6 +25,7 @@
 
 #include "blackbox/blackbox.h"
 #include "blackbox/blackbox_fielddefs.h"
+#include "blackbox/blackbox_params.h"
 
 #include "build/build_config.h"
 
@@ -353,7 +354,9 @@ void processRcAdjustments(void)
                 adjval = constrain(adjval, adjRange->adjMin, adjRange->adjMax);
 
                 if (adjval != adjState->adjValue) {
+                    blackboxParamsOpBegin(BBP_SRC_ADJUSTMENT, adjFunc);
                     adjConfig->cfgSet(adjval);
+                    blackboxParamsOpEnd();
                     adjval = adjConfig->cfgGet();
 
                     if (adjval != adjState->adjValue) {
