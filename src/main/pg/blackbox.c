@@ -63,6 +63,7 @@ PG_RESET_TEMPLATE(blackboxConfig_t, blackboxConfig,
     .initialEraseFreeSpaceKiB = 0,
     .rollingErase = 1,
     .gracePeriod = 5,
+    .params = BLACKBOX_PARAMS_FULL,
 );
 
 #endif
