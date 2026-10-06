@@ -40,8 +40,12 @@
 
 #define	__unused	__attribute__((__unused__))
 
+#ifndef PID_PROFILE_COUNT
 #define PID_PROFILE_COUNT 3
+#endif
+#ifndef CONTROL_RATE_PROFILE_COUNT
 #define CONTROL_RATE_PROFILE_COUNT  6
+#endif
 #define USE_MAG
 #define USE_BARO
 #define USE_GPS
