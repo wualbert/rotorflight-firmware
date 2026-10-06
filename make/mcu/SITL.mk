@@ -33,8 +33,10 @@ ARM_SDK_PREFIX  =
 
 # common/string_light.c: the host C library has these functions, and with
 #   -iquote <ctype.h> is the host header (glibc macros, not common/ctype.h).
+# flight/servos.c: compiled through target/SITL/servos_sitl.c
 MCU_EXCLUDES = \
             common/string_light.c \
+            flight/servos.c \
             drivers/adc.c \
             drivers/bus_i2c.c \
             drivers/bus_i2c_config.c \
