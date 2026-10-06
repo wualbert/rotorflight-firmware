@@ -199,9 +199,12 @@ static void* tcpThread(void* data) {
 
     dyad_init();
     dyad_setTickInterval(0.2f);
-    dyad_setUpdateTimeout(0.5f);
+    // dyad is not thread safe, so this thread also opens the serial ports and
+    // sends their data (tcpThreadUpdate). Wake up at least every 1 ms for this.
+    dyad_setUpdateTimeout(0.001);
 
     while (workerRunning) {
+        tcpThreadUpdate();
         dyad_update();
     }
 

@@ -25,7 +25,7 @@
 #include "dyad.h"
 
 #define RX_BUFFER_SIZE    1400
-#define TX_BUFFER_SIZE    1400
+#define TX_BUFFER_SIZE    8192    // a few ms of blackbox data if the TCP thread is late
 
 typedef struct {
     serialPort_t port;
@@ -46,6 +46,7 @@ serialPort_t *serTcpOpen(int id, serialReceiveCallbackPtr rxCallback, void *rxCa
 // tcpPort API
 void tcpDataIn(tcpPort_t *instance, uint8_t* ch, int size);
 void tcpDataOut(tcpPort_t *instance);
+void tcpThreadUpdate(void);
 
 bool tcpIsStart(void);
 bool* tcpGetUsed(void);

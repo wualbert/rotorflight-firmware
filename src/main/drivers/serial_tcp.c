@@ -43,6 +43,11 @@
 static const struct serialPortVTable tcpVTable; // Forward
 static tcpPort_t tcpSerialPorts[SERIAL_PORT_COUNT];
 static bool tcpPortInitialized[SERIAL_PORT_COUNT];
+// dyad is not thread safe, so only the TCP thread (tcpThreadUpdate) calls it.
+// The main thread sets tcpListenRequest[id]; the TCP thread then opens the
+// server socket and sets tcpListening[id].
+static bool tcpListenRequest[SERIAL_PORT_COUNT];
+static bool tcpListening[SERIAL_PORT_COUNT];
 static bool tcpStart = false;
 bool tcpIsStart(void) {
     return tcpStart;
@@ -73,7 +78,9 @@ static void onAccept(dyad_Event *e) {
     fprintf(stderr, "[NEW]UART%u: %d,%d\n", s->id + 1, s->connected, s->clientCount);
     s->conn = e->remote;
     dyad_setNoDelay(e->remote, 1);
-    dyad_setTimeout(e->remote, 120);
+    // No idle timeout: a blackbox port sends nothing while disarmed, and a
+    // capture client does not send at all.
+    dyad_setTimeout(e->remote, 0);
     dyad_addListener(e->remote, DYAD_EVENT_DATA, onData, e->udata);
     dyad_addListener(e->remote, DYAD_EVENT_CLOSE, onClose, e->udata);
 }
@@ -102,6 +109,17 @@ static tcpPort_t* tcpReconfigure(tcpPort_t *s, int id)
     s->clientCount = 0;
     s->id = id;
     s->conn = NULL;
+    s->serv = NULL;
+
+    __atomic_store_n(&tcpListenRequest[id], true, __ATOMIC_RELEASE);
+    return s;
+}
+
+// TCP thread only
+static void tcpListen(tcpPort_t *s)
+{
+    const int id = s->id;
+
     s->serv = dyad_newStream();
     dyad_setNoDelay(s->serv, 1);
     dyad_addListener(s->serv, DYAD_EVENT_ACCEPT, onAccept, s);
@@ -111,7 +129,6 @@ static tcpPort_t* tcpReconfigure(tcpPort_t *s, int id)
     } else {
         fprintf(stderr, "bind port %u for UART%u failed!!\n", (unsigned)BASE_PORT + id + 1, (unsigned)id + 1);
     }
-    return s;
 }
 
 serialPort_t *serTcpOpen(int id, serialReceiveCallbackPtr rxCallback, void *rxCallbackData, uint32_t baudRate, portMode_e mode, portOptions_e options)
@@ -217,27 +234,45 @@ void tcpWrite(serialPort_t *instance, uint8_t ch)
     }
     pthread_mutex_unlock(&s->txLock);
 
-    tcpDataOut(s);
+    // dyad is not thread safe: the TCP thread sends the data (tcpThreadUpdate)
 }
 
+// TCP thread only. Moves the TX ring buffer to the dyad stream. Without a
+// client the data is lost, as on a UART with nothing connected.
 void tcpDataOut(tcpPort_t *instance)
 {
     tcpPort_t *s = (tcpPort_t *)instance;
-    if (s->conn == NULL) return;
     pthread_mutex_lock(&s->txLock);
 
-    if (s->port.txBufferHead < s->port.txBufferTail) {
-        // send data till end of buffer
-        int chunk = s->port.txBufferSize - s->port.txBufferTail;
-        dyad_write(s->conn, (const void *)&s->port.txBuffer[s->port.txBufferTail], chunk);
-        s->port.txBufferTail = 0;
+    if (s->conn != NULL) {
+        if (s->port.txBufferHead < s->port.txBufferTail) {
+            // send data till end of buffer
+            int chunk = s->port.txBufferSize - s->port.txBufferTail;
+            dyad_write(s->conn, (const void *)&s->port.txBuffer[s->port.txBufferTail], chunk);
+            s->port.txBufferTail = 0;
+        }
+        int chunk = s->port.txBufferHead - s->port.txBufferTail;
+        if (chunk)
+            dyad_write(s->conn, (const void*)&s->port.txBuffer[s->port.txBufferTail], chunk);
     }
-    int chunk = s->port.txBufferHead - s->port.txBufferTail;
-    if (chunk)
-        dyad_write(s->conn, (const void*)&s->port.txBuffer[s->port.txBufferTail], chunk);
     s->port.txBufferTail = s->port.txBufferHead;
 
     pthread_mutex_unlock(&s->txLock);
+}
+
+// TCP thread only: call before each dyad_update(). Opens the server sockets
+// of new ports and sends the TX data of all ports.
+void tcpThreadUpdate(void)
+{
+    for (int id = 0; id < SERIAL_PORT_COUNT; id++) {
+        if (!tcpListening[id] && __atomic_load_n(&tcpListenRequest[id], __ATOMIC_ACQUIRE)) {
+            tcpListen(&tcpSerialPorts[id]);
+            tcpListening[id] = true;
+        }
+        if (tcpListening[id]) {
+            tcpDataOut(&tcpSerialPorts[id]);
+        }
+    }
 }
 
 void tcpDataIn(tcpPort_t *instance, uint8_t* ch, int size)
