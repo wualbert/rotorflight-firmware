@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <time.h>
+#include <sys/prctl.h>
 
 #include "common/maths.h"
 
@@ -255,8 +256,16 @@ static void* tcpThread(void* data) {
 void systemInit(void) {
     int ret;
 
+    // stdout is often a file or a pipe: write each line at once
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    // The main loop sleeps 50 us after each scheduler() call. With the
+    // default timer slack (50 us) such a sleep takes about 140 us in a VM.
+    prctl(PR_SET_TIMERSLACK, 1UL);
+
     clock_gettime(CLOCK_MONOTONIC, &start_time);
-    printf("[system]Init...\n");
+    // micros() is the time since this CLOCK_MONOTONIC instant (simRate 1)
+    printf("[system]Init... CLOCK_MONOTONIC start %ld.%09ld\n", (long)start_time.tv_sec, (long)start_time.tv_nsec);
 
     SystemCoreClock = 500 * 1e6; // fake 500MHz
 
@@ -653,7 +662,6 @@ FLASH_Status FLASH_ErasePage(uintptr_t Page_Address) {
 FLASH_Status FLASH_ProgramWord(uintptr_t addr, uint32_t value) {
     if ((addr >= (uintptr_t)eepromData) && (addr < (uintptr_t)ARRAYEND(eepromData))) {
         *((uint32_t*)addr) = value;
-        printf("[FLASH_ProgramWord]%p = %08x\n", (void*)addr, *((uint32_t*)addr));
     } else {
             printf("[FLASH_ProgramWord]%p out of range!\n", (void*)addr);
     }
