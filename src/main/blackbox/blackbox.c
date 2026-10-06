@@ -337,8 +337,17 @@ static const blackboxSimpleFieldDefinition_t blackboxSlowFields[] = {
 
     {"failsafePhase",         -1, UNSIGNED, PREDICT(0),      ENCODING(TAG2_3S32)},
     {"rxSignalReceived",      -1, UNSIGNED, PREDICT(0),      ENCODING(TAG2_3S32)},
-    {"rxFlightChannelsValid", -1, UNSIGNED, PREDICT(0),      ENCODING(TAG2_3S32)}
+    {"rxFlightChannelsValid", -1, UNSIGNED, PREDICT(0),      ENCODING(TAG2_3S32)},
+
+    // Parameter log: written unless blackbox_params is OFF
+    {"pidProfile",            -1, UNSIGNED, PREDICT(0),      ENCODING(UNSIGNED_VB)},
+    {"rateProfile",           -1, UNSIGNED, PREDICT(0),      ENCODING(UNSIGNED_VB)},
+    {"armed",                 -1, UNSIGNED, PREDICT(0),      ENCODING(UNSIGNED_VB)},
+    {"paramSeq",              -1, UNSIGNED, PREDICT(0),      ENCODING(UNSIGNED_VB)}
 };
+
+// Slow fields of a log with blackbox_params = OFF (the 4.6.0 format)
+#define BLACKBOX_SLOW_FIELD_COUNT_BASIC 5
 
 typedef enum BlackboxState {
     BLACKBOX_STATE_DISABLED = 0,
@@ -445,6 +454,10 @@ typedef struct blackboxSlowState_s {
     uint8_t failsafePhase;
     bool rxSignalReceived;
     bool rxFlightChannelsValid;
+    uint8_t pidProfile;
+    uint8_t rateProfile;
+    uint8_t armed;
+    uint32_t paramSeq;
 } __attribute__((__packed__)) blackboxSlowState_t; // We pack this struct so that padding doesn't interfere with memcmp()
 
 //From rc_controls.c
@@ -453,6 +466,9 @@ extern boxBitmask_t rcModeActivationMask;
 static BlackboxState blackboxState = BLACKBOX_STATE_DISABLED;
 
 static bool blackboxStarted = false;
+
+// The S-frames of this log carry the parameter log fields
+static bool blackboxSlowParamFields = false;
 
 static uint32_t blackboxLastArmingBeep = 0;
 static uint32_t blackboxLastFlightModeFlags = 0; // New event tracking of flight modes
@@ -1098,6 +1114,18 @@ static void writeSlowFrame(void)
     values[1] = slowHistory.rxSignalReceived ? 1 : 0;
     values[2] = slowHistory.rxFlightChannelsValid ? 1 : 0;
     blackboxWriteTag2_3S32(values);
+
+    if (blackboxSlowParamFields) {
+        blackboxWriteUnsignedVB(slowHistory.pidProfile);
+        blackboxWriteUnsignedVB(slowHistory.rateProfile);
+        blackboxWriteUnsignedVB(slowHistory.armed);
+        blackboxWriteUnsignedVB(slowHistory.paramSeq);
+    }
+}
+
+static int blackboxSlowFieldCount(void)
+{
+    return blackboxSlowParamFields ? ARRAYLEN(blackboxSlowFields) : BLACKBOX_SLOW_FIELD_COUNT_BASIC;
 }
 
 /**
@@ -1110,6 +1138,20 @@ static void loadSlowState(blackboxSlowState_t *slow)
     slow->failsafePhase = failsafePhase();
     slow->rxSignalReceived = rxIsReceivingSignal();
     slow->rxFlightChannelsValid = rxAreFlightChannelsValid();
+
+    if (blackboxSlowParamFields) {
+        // The profiles in use: the controllers take the pointers, not the indices in systemConfig
+        slow->pidProfile = currentPidProfile - pidProfiles(0);
+        slow->rateProfile = currentControlRateProfile - controlRateProfiles(0);
+        slow->armed = ARMING_FLAG(ARMED) ? 1 : 0;
+        slow->paramSeq = 0;
+    } else {
+        // Constant, so that a change cannot force an S-frame that 4.6.0 would not write
+        slow->pidProfile = 0;
+        slow->rateProfile = 0;
+        slow->armed = 0;
+        slow->paramSeq = 0;
+    }
 }
 
 /**
@@ -1176,6 +1218,8 @@ static void blackboxStart(void)
     }
 
     blackboxStarted = true;
+
+    blackboxSlowParamFields = (blackboxConfig()->params != BLACKBOX_PARAMS_OFF);
 
     memset(&gpsHistory, 0, sizeof(gpsHistory));
 
@@ -2126,7 +2170,7 @@ void blackboxUpdate(timeUs_t currentTimeUs)
     case BLACKBOX_STATE_SEND_SLOW_HEADER:
         blackboxReplenishHeaderBudget();
         //On entry of this state, xmitState.headerIndex is 0 and xmitState.u.fieldIndex is -1
-        if (!sendFieldDefinition('S', 0, blackboxSlowFields, blackboxSlowFields + 1, ARRAYLEN(blackboxSlowFields),
+        if (!sendFieldDefinition('S', 0, blackboxSlowFields, blackboxSlowFields + 1, blackboxSlowFieldCount(),
                 NULL, NULL)) {
             cacheFlushNextState = BLACKBOX_STATE_SEND_SYSINFO;
             blackboxSetState(BLACKBOX_STATE_CACHE_FLUSH);
