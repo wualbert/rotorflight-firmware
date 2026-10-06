@@ -300,6 +300,37 @@ static unsigned firstChangedBlock(const uint32_t *a, const uint32_t *b, unsigned
     return w;
 }
 
+// Bytes start..end-1 of group t differ from the shadow. start is a multiple of 4. The test of most groups in
+// most captures: no bitmap.
+static bool groupDiffers(int t, unsigned start, unsigned end)
+{
+    const uint8_t *live = bbpPg[t].reg->address;
+    const uint8_t *shadow = bbpShadow(t);
+    unsigned i = start;
+
+    if (bbp.wordMask & BIT(t)) {
+        const uint32_t *a = (const uint32_t *)live;
+        const uint32_t *b = (const uint32_t *)shadow;
+        const unsigned wEnd = end / 4;
+        unsigned w = firstChangedBlock(a, b, start / 4, wEnd);
+        if (w + 8 <= wEnd) {
+            return true;
+        }
+        for (; w < wEnd; w++) {
+            if (a[w] != b[w]) {
+                return true;
+            }
+        }
+        i = wEnd * 4;
+    }
+    for (; i < end; i++) {
+        if (live[i] != shadow[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Compare bytes start..end-1 of group t with the shadow. Bit w of map: bytes 4w..4w+3 differ.
 static bool diffGroup(int t, unsigned start, unsigned end, uint32_t *map)
 {
@@ -804,7 +835,7 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
         const unsigned start = whole ? 0 : slot * pgElementSize(reg);
         const unsigned end = whole ? pgSize(reg) : start + pgElementSize(reg);
 
-        if (!diffGroup(t, start & ~3, end, map)) {
+        if (!groupDiffers(t, start & ~3, end) || !diffGroup(t, start & ~3, end, map)) {
             if (whole) {
                 bbpVerified[t] = at;
                 bbp.prevMask &= ~BIT(t);
@@ -866,7 +897,7 @@ lost:
             const bool whole = (slot < 0 || t != slotGroup);
             const unsigned start = whole ? 0 : slot * pgElementSize(bbpPg[t].reg);
             const unsigned end = whole ? pgSize(bbpPg[t].reg) : start + pgElementSize(bbpPg[t].reg);
-            if (diffGroup(t, start & ~3, end, map)) {
+            if (groupDiffers(t, start & ~3, end)) {
                 bbp.lostMask |= BIT(t);
             }
         }
@@ -1279,8 +1310,6 @@ static void resyncOneGroup(bbpPoint_t now)
  */
 static void scanStep(bbpPoint_t now)
 {
-    uint32_t map[BBP_DIFF_WORDS];
-
     for (int i = 0; i < BBP_TRACKED && !(bbp.allMask & BIT(bbp.scanPg)); i++) {
         bbp.scanPg = (bbp.scanPg + 1) % BBP_TRACKED;
         bbp.scanOff = 0;
@@ -1296,7 +1325,7 @@ static void scanStep(bbpPoint_t now)
     const unsigned size = pgSize(bbpPg[t].reg);
     const unsigned end = MIN(bbp.scanOff + (unsigned)BBP_SCAN_BYTES, size);
 
-    if (diffGroup(t, bbp.scanOff, end, map)) {
+    if (groupDiffers(t, bbp.scanOff, end)) {
         capture(false, 'u', BBP_ARG_NONE, now, BIT(t), -1, -1);
         bbp.scanOff = size;
     } else if (end >= size) {
