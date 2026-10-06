@@ -117,6 +117,9 @@ extern const bbpElementKind_t bbpElementKinds[BBP_ELEMENT_KINDS];
 
 const bbpElementKind_t *bbpElementKind(pgn_t pgn);
 
+// Bytes of a field of an element
+int bbpFieldWidth(const bbpField_t *field);
+
 /* Text */
 
 // A bounded text writer. Nothing is written past 'end'; 'overflow' tells that the text did not fit.
@@ -153,6 +156,45 @@ static inline bool bbpEntryInHeader(int t, const clivalue_t *v)
 
 // Byte of group t that a set or element line gives
 bool bbpByteCovered(int t, unsigned offset);
+
+/* Journal */
+
+#define BBP_PRE             0xFFFFFFFF  // point before T0, the first RUNNING entry of the log
+
+// A point in the log: after ticks 0..c-1 of the PID cycle that logged iteration n records
+typedef struct {
+    uint32_t    n;
+    uint8_t     c;
+} bbpPoint_t;
+
+#define BBP_EVENT_MAX       128     // chars in one journal event (the decoder limit is 252)
+#define BBP_ITEM_MAX        80      // chars in one item "KEY=NEW<OLD": it fits in a continuation event
+#define BBP_ITEM_BYTES_MAX  32      // bytes of one side of an item
+#define BBP_RAW_ITEM_BYTES  16      // bytes in one "pg.<pgn>+<off>" item
+
+// Item codes
+#define BBP_CODE_ELEMENT    0x8000  // | kind << 8 | element
+#define BBP_CODE_PID_INDEX  0x9000  // pid_profile
+#define BBP_CODE_RATE_INDEX 0x9001  // rate_profile
+#define BBP_CODE_RAW        0xC000  // | tracked group; the offset is in slot (low) and index (high)
+#define BBP_SLOT_NONE       0xFF
+
+// Text of one item from its bytes. False when it did not fit.
+bool bbpPutItem(bbpWriter_t *w, uint16_t code, uint8_t slot, uint8_t index, const uint8_t *newBytes, const uint8_t *oldBytes, uint8_t length);
+
+// A valueTable entry whose items fit in BBP_ITEM_MAX chars and BBP_ITEM_BYTES_MAX bytes. Other bytes are raw items.
+bool bbpItemFits(const clivalue_t *v);
+
+// Bytes of an item of the entry: a bitset gives its whole variable, an array one element
+int bbpItemWidth(const clivalue_t *v);
+
+// Loader regions: bit t for each tracked group that the loader reads
+extern uint32_t bbpLoaderRegion[];
+// Index in bbpTrackedPgs of the group of profile slots that the loader reads (PID or rate profiles), or -1
+int bbpLoaderSlotGroup(int loader);
+void bbpTablesInit(void);
+
+extern const char * const bbpLoaderNames[];
 
 /* Header section */
 

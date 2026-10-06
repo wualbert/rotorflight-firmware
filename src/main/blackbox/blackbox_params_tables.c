@@ -52,6 +52,7 @@
 #include "pg/system.h"
 #include "pg/voltage.h"
 
+#include "blackbox/blackbox_params.h"
 #include "blackbox/blackbox_params_impl.h"
 
 /*
@@ -199,6 +200,104 @@ const bbpElementKind_t *bbpElementKind(pgn_t pgn)
         }
     }
     return NULL;
+}
+
+/*
+ * Loader regions: the groups that each loader reads. They are generous: a write in an operation that comes
+ * before the loader is captured before its 'A' record only when the region has its group.
+ */
+static const pgn_t regionPid[] = {
+    PG_PID_PROFILE, PG_PID_CONFIG, PG_SYSTEM_CONFIG, PG_GOVERNOR_CONFIG, PG_MOTOR_CONFIG, PG_GENERIC_MIXER_CONFIG,
+    PG_BATTERY_CONFIG, 0
+};
+static const pgn_t regionGovernor[] = {
+    PG_PID_PROFILE, PG_GOVERNOR_CONFIG, PG_MOTOR_CONFIG, PG_GENERIC_MIXER_CONFIG, PG_BATTERY_CONFIG, 0
+};
+static const pgn_t regionRescue[] = {
+    PG_PID_PROFILE, 0
+};
+static const pgn_t regionSetpoint[] = {
+    PG_CONTROL_RATE_PROFILES, PG_SYSTEM_CONFIG, 0
+};
+static const pgn_t regionGyroFilter[] = {
+    PG_GYRO_CONFIG, PG_DYN_NOTCH_CONFIG, PG_PID_CONFIG, 0
+};
+static const pgn_t regionRpmFilter[] = {
+    PG_RPM_FILTER_CONFIG, PG_MOTOR_CONFIG, PG_FREQ_SENSOR_CONFIG, PG_FEATURE_CONFIG, PG_GENERIC_MIXER_CONFIG, 0
+};
+static const pgn_t regionMixer[] = {
+    PG_GENERIC_MIXER_CONFIG, PG_GENERIC_MIXER_INPUTS, PG_GENERIC_MIXER_RULES, PG_SERVO_PARAMS, 0
+};
+static const pgn_t regionRcControls[] = {
+    PG_RC_CONTROLS_CONFIG, PG_RX_CONFIG, PG_ARMING_CONFIG, 0
+};
+static const pgn_t regionFeature[] = {
+    PG_FEATURE_CONFIG, 0
+};
+
+// NULL: all tracked groups
+static const pgn_t * const loaderRegions[BBP_LOADER_COUNT] = {
+    [BBP_LOADER_PID]            = regionPid,
+    [BBP_LOADER_GOVERNOR]       = regionGovernor,
+    [BBP_LOADER_RESCUE]         = regionRescue,
+    [BBP_LOADER_SETPOINT]       = regionSetpoint,
+    [BBP_LOADER_GYRO_FILTER]    = regionGyroFilter,
+    [BBP_LOADER_RPM_FILTER]     = regionRpmFilter,
+    [BBP_LOADER_MIXER]          = regionMixer,
+    [BBP_LOADER_RC_CONTROLS]    = regionRcControls,
+    [BBP_LOADER_ACTIVATE]       = NULL,
+    [BBP_LOADER_FEATURE]        = regionFeature,
+};
+
+const char * const bbpLoaderNames[BBP_LOADER_COUNT] = {
+    [BBP_LOADER_PID]            = "pid",
+    [BBP_LOADER_GOVERNOR]       = "gov",
+    [BBP_LOADER_RESCUE]         = "rsc",
+    [BBP_LOADER_SETPOINT]       = "sp",
+    [BBP_LOADER_GYRO_FILTER]    = "gyrof",
+    [BBP_LOADER_RPM_FILTER]     = "rpmf",
+    [BBP_LOADER_MIXER]          = "mix",
+    [BBP_LOADER_RC_CONTROLS]    = "rcctl",
+    [BBP_LOADER_ACTIVATE]       = "act",
+    [BBP_LOADER_FEATURE]        = "feat",
+};
+
+uint32_t bbpLoaderRegion[BBP_LOADER_COUNT];
+
+int bbpLoaderSlotGroup(int loader)
+{
+    switch (loader) {
+    case BBP_LOADER_PID:
+    case BBP_LOADER_GOVERNOR:
+    case BBP_LOADER_RESCUE:
+        return bbpTrackedIndex(PG_PID_PROFILE);
+    case BBP_LOADER_SETPOINT:
+        return bbpTrackedIndex(PG_CONTROL_RATE_PROFILES);
+    default:
+        return -1;
+    }
+}
+
+void bbpTablesInit(void)
+{
+    for (int l = 0; l < BBP_LOADER_COUNT; l++) {
+        uint32_t mask = 0;
+        if (loaderRegions[l]) {
+            for (const pgn_t *pgn = loaderRegions[l]; *pgn; pgn++) {
+                const int t = bbpTrackedIndex(*pgn);
+                if (t >= 0) {
+                    mask |= BIT(t);
+                }
+            }
+        } else {
+            for (int t = 0; t < BBP_TRACKED; t++) {
+                if (bbpPg[t].reg) {
+                    mask |= BIT(t);
+                }
+            }
+        }
+        bbpLoaderRegion[l] = mask;
+    }
 }
 
 #endif

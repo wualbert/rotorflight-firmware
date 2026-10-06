@@ -300,7 +300,7 @@ static bool valueDiffers(const clivalue_t *v, const uint8_t *a, const uint8_t *b
 
 /* Elements */
 
-static int fieldWidth(const bbpField_t *field)
+int bbpFieldWidth(const bbpField_t *field)
 {
     switch (field->type) {
     case BBP_F_U16:
@@ -345,11 +345,101 @@ static bool elementDiffers(const bbpElementKind_t *kind, const uint8_t *a, const
 {
     for (int f = 0; f < kind->fieldCount; f++) {
         const bbpField_t *field = &kind->fields[f];
-        if (memcmp(a + field->offset, b + field->offset, fieldWidth(field))) {
+        if (memcmp(a + field->offset, b + field->offset, bbpFieldWidth(field))) {
             return true;
         }
     }
     return false;
+}
+
+/* Journal items */
+
+int bbpItemWidth(const clivalue_t *v)
+{
+    switch (v->type & VALUE_MODE_MASK) {
+    case MODE_STRING:
+        return v->config.string.maxlength;
+    default:
+        // A bitset: its variable. An array: one element.
+        return typeSize(v);
+    }
+}
+
+bool bbpItemFits(const clivalue_t *v)
+{
+    // "p5.<name>[255]=<new><<old>"
+    const bool array = (v->type & VALUE_MODE_MASK) == MODE_ARRAY;
+    const int valueLength = array ? numberMaxLength(v) : bbpValueMaxLength(v);
+    const int width = array ? typeSize(v) : bbpItemWidth(v);
+
+    return width <= BBP_ITEM_BYTES_MAX &&
+        (int)strlen("p5.[255]=<") + (int)strlen(v->name) + 2 * valueLength <= BBP_ITEM_MAX;
+}
+
+static void putItemValue(bbpWriter_t *w, const clivalue_t *v, uint8_t index, const uint8_t *p)
+{
+    if (index != BBP_SLOT_NONE) {
+        // One element of an array
+        if ((v->type & VALUE_TYPE_MASK) == VAR_UINT32) {
+            bbpPutUint(w, readValue(v, p, 0));
+        } else {
+            bbpPutInt(w, readValue(v, p, 0));
+        }
+    } else {
+        bbpPutValue(w, v, p);
+    }
+}
+
+bool bbpPutItem(bbpWriter_t *w, uint16_t code, uint8_t slot, uint8_t index, const uint8_t *newBytes, const uint8_t *oldBytes, uint8_t length)
+{
+    if (code < BBP_CODE_ELEMENT) {
+        // "<name>", "p<k>.<name>", "r<k>.<name>", with "[<i>]" for one element of an array
+        const clivalue_t *v = &valueTable[code];
+        if (slot != BBP_SLOT_NONE) {
+            bbpPutChar(w, ((v->type & VALUE_SECTION_MASK) == PROFILE_RATE_VALUE) ? 'r' : 'p');
+            bbpPutUint(w, slot);
+            bbpPutChar(w, '.');
+        }
+        bbpPutStr(w, v->name);
+        if (index != BBP_SLOT_NONE) {
+            bbpPutChar(w, '[');
+            bbpPutUint(w, index);
+            bbpPutChar(w, ']');
+        }
+        bbpPutChar(w, '=');
+        putItemValue(w, v, index, newBytes);
+        bbpPutChar(w, '<');
+        putItemValue(w, v, index, oldBytes);
+    } else if (code >= BBP_CODE_RAW) {
+        // "pg.<pgn>+<offset>=<hex><<hex>"
+        bbpPutStr(w, "pg.");
+        bbpPutUint(w, pgN(bbpPg[code & 0xFF].reg));
+        bbpPutChar(w, '+');
+        bbpPutUint(w, slot | (index << 8));
+        bbpPutChar(w, '=');
+        bbpPutHexBytes(w, newBytes, length);
+        bbpPutChar(w, '<');
+        bbpPutHexBytes(w, oldBytes, length);
+    } else if (code == BBP_CODE_PID_INDEX || code == BBP_CODE_RATE_INDEX) {
+        bbpPutStr(w, (code == BBP_CODE_PID_INDEX) ? "pid_profile=" : "rate_profile=");
+        bbpPutUint(w, newBytes[0]);
+        bbpPutChar(w, '<');
+        bbpPutUint(w, oldBytes[0]);
+    } else {
+        // "el.<kind>[.<i>]=<fields><<fields>"
+        const bbpElementKind_t *kind = &bbpElementKinds[(code >> 8) & 0x0F];
+        bbpPutStr(w, "el.");
+        bbpPutStr(w, kind->name);
+        if (kind->indexed) {
+            bbpPutChar(w, '.');
+            bbpPutUint(w, code & 0xFF);
+        }
+        bbpPutChar(w, '=');
+        bbpPutElement(w, kind, newBytes);
+        bbpPutChar(w, '<');
+        bbpPutElement(w, kind, oldBytes);
+    }
+    return !w->overflow;
 }
 
 /* Coverage: the bytes of a group that a set or element line gives */
@@ -411,7 +501,7 @@ static void buildCoverage(int t)
         const unsigned count = (perElement || !kind->indexed) ? 1 : pg->reg->length;
         for (unsigned k = 0; k < count; k++) {
             for (int f = 0; f < kind->fieldCount; f++) {
-                markCoverage(k * elementSize + kind->fields[f].offset, fieldWidth(&kind->fields[f]));
+                markCoverage(k * elementSize + kind->fields[f].offset, bbpFieldWidth(&kind->fields[f]));
             }
         }
     }

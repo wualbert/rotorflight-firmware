@@ -722,6 +722,7 @@ static void blackboxSetState(BlackboxState newState)
         break;
     case BLACKBOX_STATE_SHUTTING_DOWN:
         xmitState.u.startTime = millis();
+        blackboxParamsStop();
         break;
     default:
         ;
@@ -1299,6 +1300,11 @@ void blackboxCheckEnabler(timeUs_t currentTimeUs)
             // if grace period passed:
             FALLTHROUGH;
         case BLACKBOX_STATE_PAUSED:
+            // The parameter journal can hold the end of the log for 100 ms, while records wait
+            if (blackboxParamsHoldLogEnd()) {
+                break;
+            }
+            blackboxParamsEnd();
             blackboxLogEvent(FLIGHT_LOG_EVENT_LOG_END, NULL);
             FALLTHROUGH;
         default:
@@ -2062,6 +2068,8 @@ static void blackboxLogIteration(timeUs_t currentTimeUs)
             writeIntraframe();
         else
             writeInterframe();
+
+        blackboxParamsAfterFrame();
     }
 
 #ifdef USE_GPS
@@ -2109,6 +2117,10 @@ void blackboxUpdate(timeUs_t currentTimeUs)
     static BlackboxState cacheFlushNextState;
 
     blackboxCheckEnabler(currentTimeUs);
+
+    if (blackboxState >= BLACKBOX_STATE_WAIT_FOR_READY && blackboxState <= BLACKBOX_STATE_CACHE_FLUSH) {
+        blackboxParamsHeaderTick();
+    }
 
     if (IS_RC_MODE_ACTIVE(BOXBLACKBOXERASE) &&
         blackboxState > BLACKBOX_STATE_DISABLED && blackboxState < BLACKBOX_STATE_START_ERASE) {
@@ -2217,6 +2229,9 @@ void blackboxUpdate(timeUs_t currentTimeUs)
         // Flush the cache and wait until all possible entries have been written to the media
         if (blackboxDeviceFlushForceComplete()) {
             blackboxSetState(cacheFlushNextState);
+            if (blackboxState == BLACKBOX_STATE_RUNNING) {
+                blackboxParamsRunning();
+            }
         }
         break;
     case BLACKBOX_STATE_PAUSED:
@@ -2232,6 +2247,9 @@ void blackboxUpdate(timeUs_t currentTimeUs)
             blackboxSetState(BLACKBOX_STATE_RUNNING);
 
             blackboxLogIteration(currentTimeUs);
+        } else {
+            // The parameter journal goes on while paused
+            blackboxParamsAfterFrame();
         }
         // Keep the logging timers ticking so our log iteration continues to advance
         blackboxAdvanceIterationTimers();
@@ -2313,6 +2331,19 @@ uint8_t blackboxGetRateDenom(void)
 uint32_t blackboxGetPInterval(void)
 {
     return blackboxPInterval;
+}
+
+// The loopIteration of the next frame
+uint32_t blackboxGetIteration(void)
+{
+    return blackboxIteration;
+}
+
+// A log is open after its header: frames and events can be written
+bool blackboxIsLogRunning(void)
+{
+    return blackboxState == BLACKBOX_STATE_RUNNING || blackboxState == BLACKBOX_STATE_PAUSED ||
+        blackboxState == BLACKBOX_STATE_GRACE_PERIOD;
 }
 
 void blackboxFlush(timeUs_t currentTimeUs)

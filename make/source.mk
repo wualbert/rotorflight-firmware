@@ -300,6 +300,7 @@ SPEED_OPTIMISED_SRC := $(SPEED_OPTIMISED_SRC) \
 
 SIZE_OPTIMISED_SRC := $(SIZE_OPTIMISED_SRC) \
             $(shell find $(SRC_DIR) -name '*_init.c') \
+            blackbox/blackbox_params.c \
             blackbox/blackbox_params_format.c \
             blackbox/blackbox_params_tables.c \
             bus_bst_stm32f30x.c \
