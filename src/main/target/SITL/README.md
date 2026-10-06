@@ -1,3 +1,6 @@
+## Rotorflight 4.6 on Linux
+For the SITL test harness (no simulator: simulated IMU and RC, MSP, blackbox capture) see `tools/sitl/README.md`.
+
 ## SITL in gazebo 8 with ArduCopterPlugin
 SITL (software in the loop) simulator allows you to run betaflight/cleanflight without any hardware.
 Currently only tested on Ubuntu 16.04, x86_64, gcc (Ubuntu 5.4.0-6ubuntu1~16.04.4) 5.4.0 20160609.
