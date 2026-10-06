@@ -89,7 +89,8 @@ void sendMotorUpdate(void) {
 void updateState(const fdm_packet* pkt) {
     static double last_timestamp = 0; // in seconds
     static uint64_t last_realtime = 0; // in uS
-    static struct timespec last_ts; // last packet
+    static double rateStartSim = -1; // start of the simRate measurement
+    static struct timespec rateStartTs;
 
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
@@ -98,12 +99,19 @@ void updateState(const fdm_packet* pkt) {
     if (realtime_now > last_realtime + 500*1e3) { // 500ms timeout
         last_timestamp = pkt->timestamp;
         last_realtime = realtime_now;
+        rateStartSim = -1;
         sendMotorUpdate();
         return;
     }
 
     const double deltaSim = pkt->timestamp - last_timestamp;  // in seconds
     if (deltaSim < 0) { // don't use old packet
+        return;
+    }
+
+    if (fakeAccDev == NULL || fakeGyroDev == NULL) { // sensors not initialised yet
+        last_timestamp = pkt->timestamp;
+        last_realtime = realtime_now;
         return;
     }
 
@@ -157,19 +165,26 @@ void updateState(const fdm_packet* pkt) {
 #endif
 
 
-    if (deltaSim < 0.02 && deltaSim > 0) { // simulator should run faster than 50Hz
-//        simRate = simRate * 0.5 + (1e6 * deltaSim / (realtime_now - last_realtime)) * 0.5;
+    // simRate = simulator time / real time. One packet pair gives a wrong rate
+    // when packets arrive in bursts (a 1 ms step received 10 us after the
+    // previous packet gives 100), so measure it over at least 200 ms.
+    if (rateStartSim < 0 || deltaSim >= 0.02) { // simulator should run faster than 50Hz
+        rateStartSim = pkt->timestamp;
+        rateStartTs = now_ts;
+    } else {
         struct timespec out_ts;
-        timeval_sub(&out_ts, &now_ts, &last_ts);
-        simRate = deltaSim / (out_ts.tv_sec + 1e-9*out_ts.tv_nsec);
+        timeval_sub(&out_ts, &now_ts, &rateStartTs);
+        const double deltaReal = out_ts.tv_sec + 1e-9 * out_ts.tv_nsec;
+        if (deltaReal >= 0.2) {
+            simRate = (pkt->timestamp - rateStartSim) / deltaReal;
+            rateStartSim = pkt->timestamp;
+            rateStartTs = now_ts;
+        }
     }
 //    printf("simRate = %lf, millis64 = %lu, millis64_real = %lu, deltaSim = %lf\n", simRate, millis64(), millis64_real(), deltaSim*1e6);
 
     last_timestamp = pkt->timestamp;
     last_realtime = micros64_real();
-
-    last_ts.tv_sec = now_ts.tv_sec;
-    last_ts.tv_nsec = now_ts.tv_nsec;
 
     pthread_mutex_unlock(&updateLock); // can send PWM output now
 
@@ -290,46 +305,51 @@ void indicateFailure(failureMode_e mode, int repeatCount)
 
 // Time part
 // Thanks ArduPilot
+static uint64_t timespecToNanos(const struct timespec *ts)
+{
+    return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+}
+
 uint64_t nanos64_real(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (ts.tv_sec*1e9 + ts.tv_nsec) - (start_time.tv_sec*1e9 + start_time.tv_nsec);
+    return timespecToNanos(&ts) - timespecToNanos(&start_time);
 }
 
 uint64_t micros64_real(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return 1.0e6*((ts.tv_sec + (ts.tv_nsec*1.0e-9)) - (start_time.tv_sec + (start_time.tv_nsec*1.0e-9)));
+    return nanos64_real() / 1000;
 }
 
 uint64_t millis64_real(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return 1.0e3*((ts.tv_sec + (ts.tv_nsec*1.0e-9)) - (start_time.tv_sec + (start_time.tv_nsec*1.0e-9)));
+    return nanos64_real() / 1000000;
+}
+
+// Simulated time: real time scaled by simRate (the simulator time over the
+// real time, from the FDM packets). Several threads read the clock, so one
+// lock keeps it monotonic.
+static pthread_mutex_t simClockLock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t nanos64(void)
+{
+    static uint64_t last = 0;
+    static uint64_t out = 0;
+
+    pthread_mutex_lock(&simClockLock);
+    const uint64_t now = nanos64_real();
+    out += (uint64_t)((now - last) * simRate);
+    last = now;
+    const uint64_t result = out;
+    pthread_mutex_unlock(&simClockLock);
+
+    return result;
 }
 
 uint64_t micros64(void) {
-    static uint64_t last = 0;
-    static uint64_t out = 0;
-    uint64_t now = nanos64_real();
-
-    out += (now - last) * simRate;
-    last = now;
-
-    return out*1e-3;
-//    return micros64_real();
+    return nanos64() / 1000;
 }
 
 uint64_t millis64(void) {
-    static uint64_t last = 0;
-    static uint64_t out = 0;
-    uint64_t now = nanos64_real();
-
-    out += (now - last) * simRate;
-    last = now;
-
-    return out*1e-6;
-//    return millis64_real();
+    return nanos64() / 1000000;
 }
 
 uint32_t micros(void) {
