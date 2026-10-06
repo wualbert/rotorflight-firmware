@@ -46,6 +46,12 @@ static void featureClear(const uint32_t mask, uint32_t *features)
     *features &= ~(mask);
 }
 
+// The runtime feature mask. It can differ from the configured mask until the next reboot.
+uint32_t featureRuntimeMask(void)
+{
+    return runtimeFeatureMask;
+}
+
 // Determines if the feature is enabled (active) in the runtime state.
 // This is the primary funciton used by code that wants to know if a
 // feature is available.

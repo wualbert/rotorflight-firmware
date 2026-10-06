@@ -245,6 +245,11 @@ int getGovernorState(void)
     return gov.state;
 }
 
+int getGovernorMode(void)
+{
+    return gov.govMode;
+}
+
 float getGovernorOutput(void)
 {
     return gov.throttleOutput;

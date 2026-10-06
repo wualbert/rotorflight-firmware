@@ -53,6 +53,7 @@ bool getGovernerEnabled(void);
 void setGovernorEnabled(bool enabled);
 
 int getGovernorState(void);
+int getGovernorMode(void);
 
 float getGovernorOutput(void);
 
