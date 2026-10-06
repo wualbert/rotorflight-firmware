@@ -427,23 +427,37 @@ uint32_t millis(void) {
     return millis64() & 0xFFFFFFFF;
 }
 
+// The scheduler (scheduler/scheduler.c) counts in cycles. Use more than one
+// cycle per microsecond of the simulated clock. With one cycle per us, the
+// gyro task stopped for good if the main loop was more than two gyro periods
+// late while schedLoopStartCycles was still at its minimum (1 us = 1 cycle):
+// after the "grossly overrun" correction 1..desiredPeriodCycles cycles
+// remain, and the gyro task runs only with fewer than schedLoopStartCycles.
+// This occurred at boot when the first scheduler() call came more than 250 us
+// after schedulerInit(): the GYRO, PID and RX tasks did not run and
+// BOOT_GRACE_TIME stayed set. With 8 cycles per us, a later loop pass runs
+// the gyro task (each pass: 7 chances in 1000), and schedLoopStartCycles
+// then increases as on hardware. The cycle counter wraps after 536 s.
+#define SITL_CYCLES_PER_US 8
+
 int32_t clockCyclesToMicros(int32_t clockCycles)
 {
-    return clockCycles;
+    return clockCycles / SITL_CYCLES_PER_US;
 }
 
 int32_t clockCyclesTo10thMicros(int32_t clockCycles)
 {
-    return clockCycles;
+    return 10 * clockCycles / SITL_CYCLES_PER_US;
 }
 
 uint32_t clockMicrosToCycles(uint32_t micros)
 {
-    return micros;
+    return micros * SITL_CYCLES_PER_US;
 }
+
 uint32_t getCycleCounter(void)
 {
-    return (uint32_t) (micros64() & 0xFFFFFFFF);
+    return (uint32_t)(nanos64() * SITL_CYCLES_PER_US / 1000);
 }
 
 void microsleep(uint32_t usec) {
