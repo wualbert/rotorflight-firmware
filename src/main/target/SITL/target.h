@@ -129,6 +129,7 @@
 #undef USE_GPS_RESCUE
 #undef USE_SERIAL_4WAY_BLHELI_BOOTLOADER
 #undef USE_SERIAL_4WAY_SK_BOOTLOADER
+#undef USE_SPORT_MASTER   // needs telemetry/smartport.c (USE_TELEMETRY_SMARTPORT)
 
 #undef USE_I2C
 #undef USE_SPI
@@ -174,6 +175,10 @@ typedef struct
 typedef struct
 {
     void* test;
+    uint32_t CCR1;  // drivers/timer_common.c: timerCCR()
+    uint32_t CCR2;
+    uint32_t CCR3;
+    uint32_t CCR4;
 } TIM_TypeDef;
 
 typedef struct
@@ -247,6 +252,13 @@ typedef struct {
     float motor_speed[4];   // normal: [0.0, 1.0], 3D: [-1.0, 1.0]
 } servo_packet;
 
+#define SIMULATOR_MAX_RC_CHANNELS 16
+
+typedef struct {
+    double timestamp;                               // in seconds
+    uint16_t channels[SIMULATOR_MAX_RC_CHANNELS];   // RC channel value: 1000..2000 us
+} rc_packet;
+
 void FLASH_Unlock(void);
 void FLASH_Lock(void);
 FLASH_Status FLASH_ErasePage(uintptr_t Page_Address);
@@ -260,4 +272,29 @@ uint64_t micros64(void);
 uint64_t millis64(void);
 
 int lockMainPID(void);
+
+// Names that the ARM toolchain (newlib), CMSIS and the STM32 device headers
+// give to the shared code. The host C library does not have them.
+
+#define __unused __attribute__((__unused__))
+
+#define SET_BIT(REG, BIT)       ((REG) |= (BIT))
+#define CLEAR_BIT(REG, BIT)     ((REG) &= ~(BIT))
+#define READ_BIT(REG, BIT)      ((REG) & (BIT))
+
+// Unique device ID: 12 bytes, the same values as U_ID_0..U_ID_2
+extern const uint32_t sitlUniqueId[3];
+#define UID_BASE                ((uintptr_t)sitlUniqueId)
+
+// No ITM (instrumentation trace) port on the host
+#define ITM                     ((void *)0)
+#define ITM_SendChar(c)         ((void)(c))
+
+// build/atomic.h: no interrupt priorities on the host. ATOMIC_BLOCK() runs
+// its block and does nothing else.
+#define __ASM                   __asm__
+#define NVIC_PriorityGroup_2    0x500
+static inline uint32_t __get_BASEPRI(void) { return 0; }
+static inline void __set_BASEPRI(uint32_t basePri) { UNUSED(basePri); }
+static inline void __set_BASEPRI_MAX(uint32_t basePri) { UNUSED(basePri); }
 

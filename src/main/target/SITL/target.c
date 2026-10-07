@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <time.h>
+#include <sys/prctl.h>
 
 #include "common/maths.h"
 
@@ -44,6 +45,7 @@ const timerHardware_t timerHardware[1]; // unused
 
 #include "drivers/accgyro/accgyro_fake.h"
 #include "flight/imu.h"
+#include "sensors/gyro.h"
 
 #include "config/feature.h"
 #include "config/config.h"
@@ -51,8 +53,13 @@ const timerHardware_t timerHardware[1]; // unused
 
 #include "pg/rx.h"
 #include "pg/motor.h"
+#include "pg/serial_pinconfig.h"
+
+#include "drivers/adc.h"
+#include "sensors/adcinternal.h"
 
 #include "rx/rx.h"
+#include "rx/msp.h"
 
 #include "dyad.h"
 #include "target/SITL/udplink.h"
@@ -64,9 +71,10 @@ static servo_packet pwmPkt;
 
 static struct timespec start_time;
 static double simRate = 1.0;
-static pthread_t tcpWorker, udpWorker;
+static pthread_t tcpWorker, udpWorker, udpRcWorker;
 static bool workerRunning = true;
-static udpLink_t stateLink, pwmLink;
+static udpLink_t stateLink, pwmLink, rcLink;
+static rc_packet rcPkt;
 static pthread_mutex_t updateLock;
 static pthread_mutex_t mainLoopLock;
 
@@ -82,10 +90,34 @@ int lockMainPID(void) {
 void sendMotorUpdate(void) {
     udpSend(&pwmLink, &pwmPkt, sizeof(servo_packet));
 }
+
+// sensors/gyro.c skips the calibration of a fake gyro: it sets
+// calibration.running = false. But 4.6 sees a calibration as complete only
+// with calibration.cycles > 0 (isGyroSensorCalibrationComplete()), so
+// ARMING_DISABLED_CALIBRATING stays set and the SITL cannot arm. Mark a
+// skipped calibration as done (zero offset, as the skip intends).
+static void completeSkippedGyroCalibration(void)
+{
+    gyroSensor_t *sensors[] = {
+        &gyro.gyroSensor1,
+#ifdef USE_MULTI_GYRO
+        &gyro.gyroSensor2,
+#endif
+    };
+
+    for (unsigned i = 0; i < ARRAYLEN(sensors); i++) {
+        gyroCalibration_t *cal = &sensors[i]->calibration;
+        if (sensors[i]->gyroDev.gyroHardware == GYRO_FAKE && !cal->running && cal->cycles == 0) {
+            cal->cycles = 1;
+        }
+    }
+}
+
 void updateState(const fdm_packet* pkt) {
     static double last_timestamp = 0; // in seconds
     static uint64_t last_realtime = 0; // in uS
-    static struct timespec last_ts; // last packet
+    static double rateStartSim = -1; // start of the simRate measurement
+    static struct timespec rateStartTs;
 
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
@@ -94,12 +126,19 @@ void updateState(const fdm_packet* pkt) {
     if (realtime_now > last_realtime + 500*1e3) { // 500ms timeout
         last_timestamp = pkt->timestamp;
         last_realtime = realtime_now;
+        rateStartSim = -1;
         sendMotorUpdate();
         return;
     }
 
     const double deltaSim = pkt->timestamp - last_timestamp;  // in seconds
     if (deltaSim < 0) { // don't use old packet
+        return;
+    }
+
+    if (fakeAccDev == NULL || fakeGyroDev == NULL) { // sensors not initialised yet
+        last_timestamp = pkt->timestamp;
+        last_realtime = realtime_now;
         return;
     }
 
@@ -114,6 +153,7 @@ void updateState(const fdm_packet* pkt) {
     y = constrain(-pkt->imu_angular_velocity_rpy[1] * GYRO_SCALE * RAD2DEG, -32767, 32767);
     z = constrain(-pkt->imu_angular_velocity_rpy[2] * GYRO_SCALE * RAD2DEG, -32767, 32767);
     fakeGyroSet(fakeGyroDev, x, y, z);
+    completeSkippedGyroCalibration();
 //    printf("[gyr]%lf,%lf,%lf\n", pkt->imu_angular_velocity_rpy[0], pkt->imu_angular_velocity_rpy[1], pkt->imu_angular_velocity_rpy[2]);
 
 #if !defined(USE_IMU_CALC)
@@ -153,19 +193,26 @@ void updateState(const fdm_packet* pkt) {
 #endif
 
 
-    if (deltaSim < 0.02 && deltaSim > 0) { // simulator should run faster than 50Hz
-//        simRate = simRate * 0.5 + (1e6 * deltaSim / (realtime_now - last_realtime)) * 0.5;
+    // simRate = simulator time / real time. One packet pair gives a wrong rate
+    // when packets arrive in bursts (a 1 ms step received 10 us after the
+    // previous packet gives 100), so measure it over at least 200 ms.
+    if (rateStartSim < 0 || deltaSim >= 0.02) { // simulator should run faster than 50Hz
+        rateStartSim = pkt->timestamp;
+        rateStartTs = now_ts;
+    } else {
         struct timespec out_ts;
-        timeval_sub(&out_ts, &now_ts, &last_ts);
-        simRate = deltaSim / (out_ts.tv_sec + 1e-9*out_ts.tv_nsec);
+        timeval_sub(&out_ts, &now_ts, &rateStartTs);
+        const double deltaReal = out_ts.tv_sec + 1e-9 * out_ts.tv_nsec;
+        if (deltaReal >= 0.2) {
+            simRate = (pkt->timestamp - rateStartSim) / deltaReal;
+            rateStartSim = pkt->timestamp;
+            rateStartTs = now_ts;
+        }
     }
 //    printf("simRate = %lf, millis64 = %lu, millis64_real = %lu, deltaSim = %lf\n", simRate, millis64(), millis64_real(), deltaSim*1e6);
 
     last_timestamp = pkt->timestamp;
     last_realtime = micros64_real();
-
-    last_ts.tv_sec = now_ts.tv_sec;
-    last_ts.tv_nsec = now_ts.tv_nsec;
 
     pthread_mutex_unlock(&updateLock); // can send PWM output now
 
@@ -190,14 +237,38 @@ static void* udpThread(void* data) {
     return NULL;
 }
 
+// RC input: UDP port 9004, rc_packet (target.h), the same as Betaflight SITL.
+// The channels go to the MSP receiver (FEATURE_RX_MSP), as MSP_SET_RAW_RC does.
+static void* udpRcThread(void* data) {
+    UNUSED(data);
+    bool received = false;
+
+    while (workerRunning) {
+        const int n = udpRecv(&rcLink, &rcPkt, sizeof(rc_packet), 100);
+        if (n == sizeof(rc_packet)) {
+            if (!received) {
+                printf("[SITL] RC packets received on UDP %d\n", rcLink.port);
+                received = true;
+            }
+            rxMspFrameReceive(rcPkt.channels, SIMULATOR_MAX_RC_CHANNELS);
+        }
+    }
+
+    printf("udpRcThread end!!\n");
+    return NULL;
+}
+
 static void* tcpThread(void* data) {
     UNUSED(data);
 
     dyad_init();
     dyad_setTickInterval(0.2f);
-    dyad_setUpdateTimeout(0.5f);
+    // dyad is not thread safe, so this thread also opens the serial ports and
+    // sends their data (tcpThreadUpdate). Wake up at least every 1 ms for this.
+    dyad_setUpdateTimeout(0.001);
 
     while (workerRunning) {
+        tcpThreadUpdate();
         dyad_update();
     }
 
@@ -210,8 +281,16 @@ static void* tcpThread(void* data) {
 void systemInit(void) {
     int ret;
 
+    // stdout is often a file or a pipe: write each line at once
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    // The main loop sleeps 50 us after each scheduler() call. With the
+    // default timer slack (50 us) such a sleep takes about 140 us in a VM.
+    prctl(PR_SET_TIMERSLACK, 1UL);
+
     clock_gettime(CLOCK_MONOTONIC, &start_time);
-    printf("[system]Init...\n");
+    // micros() is the time since this CLOCK_MONOTONIC instant (simRate 1)
+    printf("[system]Init... CLOCK_MONOTONIC start %ld.%09ld\n", (long)start_time.tv_sec, (long)start_time.tv_nsec);
 
     SystemCoreClock = 500 * 1e6; // fake 500MHz
 
@@ -243,8 +322,17 @@ void systemInit(void) {
         exit(1);
     }
 
-    // serial can't been slow down
-    rescheduleTask(TASK_SERIAL, 1);
+    ret = udpInit(&rcLink, NULL, 9004, true);
+    printf("start UDP server for RC input...%d\n", ret);
+
+    ret = pthread_create(&udpRcWorker, NULL, udpRcThread, NULL);
+    if (ret != 0) {
+        printf("Create udpRcWorker error!\n");
+        exit(1);
+    }
+
+    // init() calls systemInit() before tasksInitData(): rescheduleTask()
+    // cannot be used here. TASK_SERIAL keeps its default period.
 }
 
 void systemResetHard(void){
@@ -252,7 +340,16 @@ void systemResetHard(void){
     workerRunning = false;
     pthread_join(tcpWorker, NULL);
     pthread_join(udpWorker, NULL);
+    pthread_join(udpRcWorker, NULL);
     exit(0);
+}
+
+// drivers/system.c is not in the SITL build. A reboot (CLI "reboot", MSP_REBOOT)
+// stops the SITL process: start it again to "boot".
+void systemReset(int reason)
+{
+    printf("[system]Reset reason %d\n", reason);
+    systemResetHard();
 }
 
 void timerInit(void) {
@@ -275,46 +372,51 @@ void indicateFailure(failureMode_e mode, int repeatCount)
 
 // Time part
 // Thanks ArduPilot
+static uint64_t timespecToNanos(const struct timespec *ts)
+{
+    return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+}
+
 uint64_t nanos64_real(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (ts.tv_sec*1e9 + ts.tv_nsec) - (start_time.tv_sec*1e9 + start_time.tv_nsec);
+    return timespecToNanos(&ts) - timespecToNanos(&start_time);
 }
 
 uint64_t micros64_real(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return 1.0e6*((ts.tv_sec + (ts.tv_nsec*1.0e-9)) - (start_time.tv_sec + (start_time.tv_nsec*1.0e-9)));
+    return nanos64_real() / 1000;
 }
 
 uint64_t millis64_real(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return 1.0e3*((ts.tv_sec + (ts.tv_nsec*1.0e-9)) - (start_time.tv_sec + (start_time.tv_nsec*1.0e-9)));
+    return nanos64_real() / 1000000;
+}
+
+// Simulated time: real time scaled by simRate (the simulator time over the
+// real time, from the FDM packets). Several threads read the clock, so one
+// lock keeps it monotonic.
+static pthread_mutex_t simClockLock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t nanos64(void)
+{
+    static uint64_t last = 0;
+    static uint64_t out = 0;
+
+    pthread_mutex_lock(&simClockLock);
+    const uint64_t now = nanos64_real();
+    out += (uint64_t)((now - last) * simRate);
+    last = now;
+    const uint64_t result = out;
+    pthread_mutex_unlock(&simClockLock);
+
+    return result;
 }
 
 uint64_t micros64(void) {
-    static uint64_t last = 0;
-    static uint64_t out = 0;
-    uint64_t now = nanos64_real();
-
-    out += (now - last) * simRate;
-    last = now;
-
-    return out*1e-3;
-//    return micros64_real();
+    return nanos64() / 1000;
 }
 
 uint64_t millis64(void) {
-    static uint64_t last = 0;
-    static uint64_t out = 0;
-    uint64_t now = nanos64_real();
-
-    out += (now - last) * simRate;
-    last = now;
-
-    return out*1e-6;
-//    return millis64_real();
+    return nanos64() / 1000000;
 }
 
 uint32_t micros(void) {
@@ -325,23 +427,37 @@ uint32_t millis(void) {
     return millis64() & 0xFFFFFFFF;
 }
 
+// The scheduler (scheduler/scheduler.c) counts in cycles. Use more than one
+// cycle per microsecond of the simulated clock. With one cycle per us, the
+// gyro task stopped for good if the main loop was more than two gyro periods
+// late while schedLoopStartCycles was still at its minimum (1 us = 1 cycle):
+// after the "grossly overrun" correction 1..desiredPeriodCycles cycles
+// remain, and the gyro task runs only with fewer than schedLoopStartCycles.
+// This occurred at boot when the first scheduler() call came more than 250 us
+// after schedulerInit(): the GYRO, PID and RX tasks did not run and
+// BOOT_GRACE_TIME stayed set. With 8 cycles per us, a later loop pass runs
+// the gyro task (each pass: 7 chances in 1000), and schedLoopStartCycles
+// then increases as on hardware. The cycle counter wraps after 536 s.
+#define SITL_CYCLES_PER_US 8
+
 int32_t clockCyclesToMicros(int32_t clockCycles)
 {
-    return clockCycles;
+    return clockCycles / SITL_CYCLES_PER_US;
 }
 
 int32_t clockCyclesTo10thMicros(int32_t clockCycles)
 {
-    return clockCycles;
+    return 10 * clockCycles / SITL_CYCLES_PER_US;
 }
 
 uint32_t clockMicrosToCycles(uint32_t micros)
 {
-    return micros;
+    return micros * SITL_CYCLES_PER_US;
 }
+
 uint32_t getCycleCounter(void)
 {
-    return (uint32_t) (micros64() & 0xFFFFFFFF);
+    return (uint32_t)(nanos64() * SITL_CYCLES_PER_US / 1000);
 }
 
 void microsleep(uint32_t usec) {
@@ -391,35 +507,30 @@ int timeval_sub(struct timespec *result, struct timespec *x, struct timespec *y)
 
 
 // PWM part
-pwmOutputPort_t motors[MAX_SUPPORTED_MOTORS];
-static pwmOutputPort_t servos[MAX_SUPPORTED_SERVOS];
+FAST_DATA_ZERO_INIT pwmOutputPort_t motors[MAX_SUPPORTED_MOTORS];
 
-// real value to send
-static int16_t motorsPwm[MAX_SUPPORTED_MOTORS];
-static int16_t servosPwm[MAX_SUPPORTED_SERVOS];
-static int16_t idlePulse;
-
-void servoDevInit(const servoDevConfig_t *servoConfig) {
-    UNUSED(servoConfig);
-    for (uint8_t servoIndex = 0; servoIndex < MAX_SUPPORTED_SERVOS; servoIndex++) {
-        servos[servoIndex].enabled = true;
-    }
-}
+// Motor outputs to the simulator: throttle 0..1 (bidirectional -1..1)
+static float motorsOut[MAX_SUPPORTED_MOTORS];
 
 static motorDevice_t motorPwmDevice; // Forward
 
-pwmOutputPort_t *pwmGetMotors(void) {
+pwmOutputPort_t *pwmGetMotors(void)
+{
     return motors;
 }
 
-static float pwmConvertFromExternal(uint16_t externalValue)
-{
-    return (float)externalValue;
-}
+// flight/servos.c: the SITL has no timers, so servoInit() finds no servo and
+// does not call this. A channel that it configures writes to a dummy register.
+static timCCR_t dummyCCR[MAX_SUPPORTED_SERVOS];
 
-static uint16_t pwmConvertToExternal(float motorValue)
+void pwmOutConfig(timerChannel_t *channel, const timerHardware_t *timerHardware, uint32_t hz, uint16_t period, uint16_t value, uint8_t inversion)
 {
-    return (uint16_t)motorValue;
+    UNUSED(hz);
+    UNUSED(period);
+    UNUSED(inversion);
+    channel->ccr = &dummyCCR[0];
+    channel->tim = timerHardware ? timerHardware->tim : NULL;
+    *channel->ccr = value;
 }
 
 static void pwmDisableMotors(void)
@@ -430,18 +541,21 @@ static void pwmDisableMotors(void)
 static bool pwmEnableMotors(void)
 {
     motorPwmDevice.enabled = true;
-
     return true;
 }
 
-static void pwmWriteMotor(uint8_t index, float value)
+static void pwmWriteMotor(uint8_t index, uint8_t mode, float value)
 {
-    motorsPwm[index] = value - idlePulse;
+    UNUSED(mode);
+    if (index < MAX_SUPPORTED_MOTORS) {
+        motorsOut[index] = value;
+    }
 }
 
 static void pwmWriteMotorInt(uint8_t index, uint16_t value)
 {
-    pwmWriteMotor(index, (float)value);
+    UNUSED(index);
+    UNUSED(value);
 }
 
 static void pwmShutdownPulsesForAllMotors(void)
@@ -449,7 +563,8 @@ static void pwmShutdownPulsesForAllMotors(void)
     motorPwmDevice.enabled = false;
 }
 
-bool pwmIsMotorEnabled(uint8_t index) {
+static bool pwmIsMotorEnabled(uint8_t index)
+{
     return motors[index].enabled;
 }
 
@@ -458,49 +573,37 @@ static void pwmCompleteMotorUpdate(void)
     // send to simulator
     // for gazebo8 ArduCopterPlugin remap, normal range = [0.0, 1.0], 3D rang = [-1.0, 1.0]
 
-    double outScale = 1000.0;
-
-    pwmPkt.motor_speed[3] = motorsPwm[0] / outScale;
-    pwmPkt.motor_speed[0] = motorsPwm[1] / outScale;
-    pwmPkt.motor_speed[1] = motorsPwm[2] / outScale;
-    pwmPkt.motor_speed[2] = motorsPwm[3] / outScale;
+    pwmPkt.motor_speed[3] = motorsOut[0];
+    pwmPkt.motor_speed[0] = motorsOut[1];
+    pwmPkt.motor_speed[1] = motorsOut[2];
+    pwmPkt.motor_speed[2] = motorsOut[3];
 
     // get one "fdm_packet" can only send one "servo_packet"!!
     if (pthread_mutex_trylock(&updateLock) != 0) return;
     udpSend(&pwmLink, &pwmPkt, sizeof(servo_packet));
-//    printf("[pwm]%u:%u,%u,%u,%u\n", idlePulse, motorsPwm[0], motorsPwm[1], motorsPwm[2], motorsPwm[3]);
-}
-
-void pwmWriteServo(uint8_t index, float value) {
-    servosPwm[index] = value;
 }
 
 static motorDevice_t motorPwmDevice = {
     .vTable = {
         .postInit = motorPostInitNull,
-        .convertExternalToMotor = pwmConvertFromExternal,
-        .convertMotorToExternal = pwmConvertToExternal,
         .enable = pwmEnableMotors,
         .disable = pwmDisableMotors,
-        .isMotorEnabled = pwmIsMotorEnabled,
+        .shutdown = pwmShutdownPulsesForAllMotors,
         .updateStart = motorUpdateStartNull,
+        .updateComplete = pwmCompleteMotorUpdate,
         .write = pwmWriteMotor,
         .writeInt = pwmWriteMotorInt,
-        .updateComplete = pwmCompleteMotorUpdate,
-        .shutdown = pwmShutdownPulsesForAllMotors,
+        .isMotorEnabled = pwmIsMotorEnabled,
     }
 };
 
-motorDevice_t *motorPwmDevInit(const motorDevConfig_t *motorConfig, uint16_t _idlePulse, uint8_t motorCount, bool useUnsyncedPwm)
+motorDevice_t *motorPwmDevInit(const motorDevConfig_t *motorConfig, uint8_t motorCount)
 {
     UNUSED(motorConfig);
-    UNUSED(useUnsyncedPwm);
 
     if (motorCount > 4) {
         return NULL;
     }
-
-    idlePulse = _idlePulse;
 
     for (int motorIndex = 0; motorIndex < MAX_SUPPORTED_MOTORS && motorIndex < motorCount; motorIndex++) {
         motors[motorIndex].enabled = true;
@@ -516,6 +619,24 @@ motorDevice_t *motorPwmDevInit(const motorDevConfig_t *motorConfig, uint16_t _id
 uint16_t adcGetChannel(uint8_t channel) {
     UNUSED(channel);
     return 0;
+}
+
+// drivers/adc.c and the internal ADC are not in the SITL build
+bool adcIsEnabled(uint8_t channel)
+{
+    UNUSED(channel);
+    return false;
+}
+
+int16_t getCoreTemperatureCelsius(void)
+{
+    return 0;
+}
+
+// drivers/serial_pinconfig.c is not in the SITL build: no UART pins
+void pgResetFn_serialPinConfig(serialPinConfig_t *serialPinConfig)
+{
+    UNUSED(serialPinConfig);
 }
 
 // stack part
@@ -580,7 +701,6 @@ FLASH_Status FLASH_ErasePage(uintptr_t Page_Address) {
 FLASH_Status FLASH_ProgramWord(uintptr_t addr, uint32_t value) {
     if ((addr >= (uintptr_t)eepromData) && (addr < (uintptr_t)ARRAYEND(eepromData))) {
         *((uint32_t*)addr) = value;
-        printf("[FLASH_ProgramWord]%p = %08x\n", (void*)addr, *((uint32_t*)addr));
     } else {
             printf("[FLASH_ProgramWord]%p out of range!\n", (void*)addr);
     }
@@ -593,6 +713,17 @@ void IOConfigGPIO(IO_t io, ioConfig_t cfg)
     UNUSED(cfg);
     printf("IOConfigGPIO\n");
 }
+
+void IOConfigGPIOAF(IO_t io, ioConfig_t cfg, uint8_t af)
+{
+    UNUSED(io);
+    UNUSED(cfg);
+    UNUSED(af);
+    printf("IOConfigGPIOAF\n");
+}
+
+// UID_BASE (target.h): the same values as U_ID_0..U_ID_2
+const uint32_t sitlUniqueId[3] = { U_ID_0, U_ID_1, U_ID_2 };
 
 void spektrumBind(rxConfig_t *rxConfig)
 {

@@ -1,6 +1,23 @@
 
-INCLUDE_DIRS    := $(INCLUDE_DIRS) \
+# src/main/common has headers (time.h, ctype.h) that have the names of C
+# library headers. With -I, they also hide the host C library headers:
+# <pthread.h> then includes common/time.h and misses clockid_t. With -iquote,
+# only #include "..." searches src/main/common, and <...> finds the host headers.
+INCLUDE_DIRS    := $(filter-out $(SRC_DIR)/common,$(INCLUDE_DIRS)) \
                    $(ROOT)/lib/main/dyad
+
+TARGET_FLAGS    = -D$(TARGET) -iquote $(SRC_DIR)/common
+
+# Upstream CI does not build SITL. SITL leaves out many features (DSHOT, LED
+# strip, telemetry), so some parameters, variables and functions are unused.
+# The ARM targets compile with -fsingle-precision-constant. SITL does not
+# (lib/main/dyad and the SITL clock need double constants), so a few debug
+# expressions such as "x * 1e6" in flight/pid.c promote float to double.
+# Show these as warnings, not errors.
+TARGET_FLAGS   += -Wno-error=unused-parameter \
+                  -Wno-error=unused-variable \
+                  -Wno-error=unused-function \
+                  -Wno-error=double-promotion
 
 MCU_COMMON_SRC  := $(ROOT)/lib/main/dyad/dyad.c
 
@@ -10,12 +27,16 @@ DEVICE_FLAGS    =
 LD_SCRIPT       = src/main/target/SITL/pg.ld
 STARTUP_SRC     =
 
-TARGET_FLAGS    = -D$(TARGET)
 MCU_FLASH_SIZE  := 2048
 
 ARM_SDK_PREFIX  =
 
+# common/string_light.c: the host C library has these functions, and with
+#   -iquote <ctype.h> is the host header (glibc macros, not common/ctype.h).
+# flight/servos.c: compiled through target/SITL/servos_sitl.c
 MCU_EXCLUDES = \
+            common/string_light.c \
+            flight/servos.c \
             drivers/adc.c \
             drivers/bus_i2c.c \
             drivers/bus_i2c_config.c \
