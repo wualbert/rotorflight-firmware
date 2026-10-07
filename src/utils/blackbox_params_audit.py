@@ -8,6 +8,7 @@
 #     currentControlRateProfile->, or a use of <group>_System / _SystemArray outside src/main/pg.
 #  2. The loader regions (blackbox_params_tables.c) cover the tracked groups that each loader and its callees read.
 #  3. pgRegistry_t.copy (the shadow) is used only in cli.c and the blackbox_params files.
+#  4. The MSP skip list of blackboxParamsMspBegin() is the list of spec section 3.10 (docs/Blackbox_Params_Spec.md).
 #
 # The call graph comes from the text of src/main. Of each #if group the first branch counts; write sites in
 # other branches are listed for a manual check. Static inline functions in headers are not followed. Functions that are
@@ -432,9 +433,45 @@ def main():
         print('  ' + u)
     print('only cli.c and blackbox_params: %s' % ('yes' if not bad else 'NO: ' + ', '.join(bad)))
 
-    print('\nsummary: %d writer functions, %d with a gap; %d loader regions with missing groups; copy %s' %
-          (len(rows), gaps, region_gaps, 'ok' if not bad else 'misused'))
-    return 1 if (gaps or region_gaps or bad) else 0
+    # 4. The MSP skip list
+    print('\n== MSP skip list of blackboxParamsMspBegin() against spec 3.10')
+    skip_bad = check_skip_list()
+
+    print('\nsummary: %d writer functions, %d with a gap; %d loader regions with missing groups; copy %s; skip list %s' %
+          (len(rows), gaps, region_gaps, 'ok' if not bad else 'misused', 'ok' if not skip_bad else 'differs'))
+    return 1 if (gaps or region_gaps or bad or skip_bad) else 0
+
+
+def check_skip_list():
+    """The commands without an operation: the case labels before 'return false' in blackboxParamsMspBegin()"""
+    code = strip_comments_and_strings(open(os.path.join(ROOT, 'blackbox', 'blackbox_params.c')).read())
+    m = re.search(r'bool blackboxParamsMspBegin\(.*?\{(.*?)return false;', code, re.S)
+    if not m:
+        print('blackboxParamsMspBegin() not found')
+        return True
+    in_code = set(re.findall(r'case MSP2?_(\w+):', m.group(1)))
+
+    spec_path = os.path.join(ROOT, '..', '..', 'docs', 'Blackbox_Params_Spec.md')
+    if not os.path.exists(spec_path):
+        print('spec not found (%s): not checked' % os.path.normpath(spec_path))
+        return False
+    s = re.search(r'The skip list is (.*?)\.(?:\s|\|)', open(spec_path, encoding='utf-8').read())
+    if not s:
+        print('the skip list sentence of section 3.10 not found in the spec')
+        return True
+    in_spec = set()
+    for name in re.split(r',\s*|\s+and\s+', s.group(1)):
+        name = name.strip()
+        opt = re.match(r'(\w+)\((\w+)\)$', name)
+        if opt:
+            in_spec |= {opt.group(1), opt.group(1) + opt.group(2)}
+        elif name:
+            in_spec.add(name)
+
+    for name in sorted(in_code | in_spec):
+        print('  %-24s %s' % (name, 'OK' if name in in_code and name in in_spec else
+                               'NOT IN THE SPEC' if name in in_code else 'NOT IN THE CODE'))
+    return in_code != in_spec
 
 
 if __name__ == '__main__':

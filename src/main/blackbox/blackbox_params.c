@@ -68,6 +68,7 @@
 #include "flight/setpoint.h"
 
 #include "msp/msp_protocol.h"
+#include "msp/msp_protocol_v2_betaflight.h"
 
 #include "pg/blackbox.h"
 #include "pg/pg.h"
@@ -942,6 +943,7 @@ bool blackboxParamsMspBegin(int16_t cmd)
     case MSP_SET_SERVO_OVERRIDE:
     case MSP_SET_SERVO_OVERRIDE_ALL:
     case MSP_SET_MIXER_OVERRIDE:
+    case MSP2_SEND_DSHOT_COMMAND:
     case MSP_MULTIPLE_MSP:
     case MSP_REBOOT:
         return false;
