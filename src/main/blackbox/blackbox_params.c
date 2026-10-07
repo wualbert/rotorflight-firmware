@@ -53,6 +53,7 @@
 
 #ifdef USE_BLACKBOX
 
+#include "common/crc.h"
 #include "common/maths.h"
 #include "common/utils.h"
 
@@ -1230,10 +1231,78 @@ static uint32_t runtimeValue(int i)
     }
 }
 
+/*
+ * Loader runs while no log is open (e2e proposal P2). The journal does not record them, so a change between logs ('v')
+ * of a key that a loader reads has no 'A' record: the viewer cannot tell whether the loader ran after it. Keep the hash
+ * of the region that the loader read at its last run with no log. At T0, a loader whose region has the same hash read
+ * the values of the T0 state: an 'A' record stamped p.
+ */
+static struct {
+    uint32_t hash;
+    int8_t slot;
+} bbpIdleApply[BBP_LOADER_COUNT];
+static uint32_t bbpIdleApplied;
+
+static uint32_t regionHash(int loader, int slot)
+{
+    const int slotGroup = bbpLoaderSlotGroup(loader);
+    uint32_t hash = FNV_OFFSET_BASIS;
+    for (int t = 0; t < BBP_TRACKED; t++) {
+        const pgRegistry_t *reg = bbpPg[t].reg;
+        if (!(bbpLoaderRegion[loader] & BIT(t)) || !reg) {
+            continue;
+        }
+        unsigned start = 0, end = pgSize(reg);
+        if (t == slotGroup && slot >= 0) {
+            start = slot * pgElementSize(reg);
+            end = start + pgElementSize(reg);
+        }
+        hash = fnv_update(hash, reg->address + start, end - start);
+    }
+    return hash;
+}
+
+static int loaderFingerprint(int loader, uint32_t *fp)
+{
+    switch (loader) {
+    case BBP_LOADER_PID:
+        *fp = runtimeValue(BBP_RT_FP_PID);
+        return 1;
+    case BBP_LOADER_GOVERNOR:
+        *fp = runtimeValue(BBP_RT_FP_GOV);
+        return 1;
+    case BBP_LOADER_SETPOINT:
+        *fp = runtimeValue(BBP_RT_FP_SP);
+        return 1;
+    case BBP_LOADER_FEATURE:
+        *fp = runtimeValue(BBP_RT_FEATURES);
+        return 1;
+    default:
+        *fp = 0;
+        return 0;
+    }
+}
+
+static int loaderSlot(int loader, int slot)
+{
+    const int slotGroup = bbpLoaderSlotGroup(loader);
+    if (slotGroup < 0 || !bbpPg[slotGroup].reg || slot >= bbpPg[slotGroup].reg->length) {
+        return -1;
+    }
+    return slot;
+}
+
 void blackboxParamsApplied(bbpLoader_e loader, int slot)
 {
     bbpChanges++;
     if (!bbp.active) {
+        // No log (and blackboxParamsInit has run): keep the hash of what the loader read
+        if (bbpLoaderRegion[loader]) {
+            const int s = loaderSlot(loader, slot);
+            bbpIdleApply[loader].slot = s;
+            bbpIdleApply[loader].hash = regionHash(loader, s);
+            bbpIdleApplied |= BIT(loader);
+        }
         return;
     }
     const bool outside = (bbp.opDepth == 0);
@@ -1732,30 +1801,44 @@ void blackboxParamsHeaderTick(void)
     }
 }
 
+#ifndef BBP_HEADER_LINES_PER_ITERATION
+#define BBP_HEADER_LINES_PER_ITERATION 4    // e2e proposal P1: a bound of the formatting time in one header iteration
+#endif
+
 bool blackboxParamsWriteHeader(void)
 {
     if (!bbp.active) {
         return true;
     }
 
-    if (bbp.linePos >= bbp.lineLength) {
-        const int length = bbpHeaderNextLine(bbpLine);
-        if (length < 0) {
-            // The 'v' compare is in the PID task, in steps: T0 waits for it
-            return !bbp.prevMask;
+    // At most 64 B in each call (the rate of the other header states, and the 64 B that blackboxWriteSysinfo()
+    // reserved), from up to BBP_HEADER_LINES_PER_ITERATION lines (e2e proposal P1: one line in each call wrote
+    // 27.6 B per iteration on average)
+    const int start = MIN(blackboxHeaderBudget, BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION);
+    int room = start;
+    int lines = 0;
+    while (room > 0) {
+        if (bbp.linePos >= bbp.lineLength) {
+            if (lines == BBP_HEADER_LINES_PER_ITERATION) {
+                break;
+            }
+            const int length = bbpHeaderNextLine(bbpLine);
+            if (length < 0) {
+                // The 'v' compare is in the PID task, in steps: T0 waits for it. A call that ends the section writes
+                // nothing.
+                return room == start && !bbp.prevMask;
+            }
+            bbp.lineLength = length;
+            bbp.linePos = 0;
+            lines++;
         }
-        bbp.lineLength = length;
-        bbp.linePos = 0;
-    }
-
-    // At most one line in each call, and at most 64 B: the rate of the other header states
-    const int count = MIN(MIN(bbp.lineLength - bbp.linePos, blackboxHeaderBudget), BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION);
-    for (int i = 0; i < count; i++) {
-        blackboxWrite(bbpLine[bbp.linePos + i]);
-    }
-    if (count > 0) {
+        const int count = MIN(bbp.lineLength - bbp.linePos, room);
+        for (int i = 0; i < count; i++) {
+            blackboxWrite(bbpLine[bbp.linePos + i]);
+        }
         bbp.linePos += count;
         blackboxHeaderBudget -= count;
+        room -= count;
     }
 
     return false;
@@ -1769,6 +1852,16 @@ void blackboxParamsRunning(void)
     if (bbp.prevMask) {
         capture(false, 'v', BBP_ARG_NONE, pointPre, bbp.prevMask, -1, -1);
     }
+
+    // The loaders that ran with no log and read the values of the T0 state: 'A' records stamped p, after the 'v' records
+    for (int l = 0; l < BBP_LOADER_COUNT; l++) {
+        if ((bbpIdleApplied & BIT(l)) && regionHash(l, bbpIdleApply[l].slot) == bbpIdleApply[l].hash) {
+            uint32_t fp;
+            const int count = loaderFingerprint(l, &fp);
+            recValues('A', l, (bbpIdleApply[l].slot >= 0) ? bbpIdleApply[l].slot : BBP_ARG_NONE, pointPre, pointPre, &fp, count);
+        }
+    }
+    bbpIdleApplied = 0;
 
     // The base of the polls
     uint32_t values[BBP_RT_COUNT];
