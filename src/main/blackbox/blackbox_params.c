@@ -1566,8 +1566,14 @@ void blackboxParamsEnd(void)
     blackboxLogCustomString(bbpLine);
 }
 
+// The log ended: SHUTTING_DOWN (also from a header state), FULL or an erase
 void blackboxParamsStop(void)
 {
+    if (bbp.ringTail != bbp.ringHead) {
+        // Records that the log did not get. Their changes are in the shadow, so the next log cannot find them in
+        // its 'v' compare: it starts with 'M shadow-reset'.
+        bbp.shadowValid = false;
+    }
     clearJournal();
     bbp.active = false;
 }

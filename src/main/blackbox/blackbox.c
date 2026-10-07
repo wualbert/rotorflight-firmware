@@ -724,6 +724,11 @@ static void blackboxSetState(BlackboxState newState)
         xmitState.u.startTime = millis();
         blackboxParamsStop();
         break;
+    case BLACKBOX_STATE_FULL:
+    case BLACKBOX_STATE_START_ERASE:
+        // The log ends without LOG_END
+        blackboxParamsStop();
+        break;
     default:
         ;
     }

@@ -1714,6 +1714,92 @@ TEST(BlackboxParamsJournalTest, BeforeT0AndBetweenLogs)
     EXPECT_EQ(0, countRecords(j, 'C'));
 }
 
+// A log that ends before its records are written: in a header state (an arm blip), or with records that wait. Their
+// changes are in the shadow, so the next log has no 'v' record of them: it starts with 'M shadow-reset'.
+TEST(BlackboxParamsJournalTest, LostRecordsGiveShadowReset)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    drainJournal();
+    blackboxParamsStop();                       // log 1 ends with all its records
+    pidProfilesMutable(0)->pid[0].P += 7;       // a change between the logs
+
+    // Log 2: the header compares groups ('v' records in the ring), then the pilot disarms before T0
+    sim.events.clear();
+    blackboxParamsStart();
+    for (int i = 0; i < 5; i++) {
+        blackboxParamsHeaderTick();
+    }
+    blackboxParamsStop();
+    EXPECT_TRUE(sim.events.empty());
+
+    // Log 3
+    sim.events.clear();
+    Decoded d = decodeHeader(runHeader());
+    expectExact(d);
+    runningLog();
+    drainJournal();
+    Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    const JRecord *m = findRecord(j, 'M');
+    ASSERT_NE(nullptr, m);
+    EXPECT_EQ("shadow-reset", m->words.at(0));
+    EXPECT_EQ(1u, m->seq);
+    EXPECT_EQ(0, countRecords(j, 'C'));
+
+    // Log 3 ends while a record waits (LOG_END after the hold): log 4 starts with 'M shadow-reset'
+    sim.freeSpace = 0;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+    pidProfilesMutable(1)->pid[0].P += 1;
+    blackboxParamsOpEnd();
+    blackboxParamsEnd();
+    blackboxParamsStop();
+    sim.freeSpace = 100000;
+    sim.events.clear();
+    runHeader();
+    runningLog();
+    drainJournal();
+    j = parseJournal(sim.events);
+    m = findRecord(j, 'M');
+    ASSERT_NE(nullptr, m);
+    EXPECT_EQ("shadow-reset", m->words.at(0));
+
+    // Log 4 ends with all its records: log 5 compares with the shadow again
+    blackboxParamsStop();
+    pidProfilesMutable(2)->pid[0].P += 1;
+    sim.events.clear();
+    runHeader();
+    runningLog();
+    drainJournal();
+    j = parseJournal(sim.events);
+    EXPECT_EQ(0, countRecords(j, 'M'));
+    EXPECT_EQ(1, countRecords(j, 'C', "v"));
+}
+
+// The device is full (BLACKBOX_STATE_FULL stops the journal): an adjustment after it is a 'v' record of the next log
+TEST(BlackboxParamsJournalTest, FullDeviceStopsTheJournal)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    drainJournal();
+    blackboxParamsStop();
+    sim.running = false;
+    blackboxParamsOpBegin(BBP_SRC_ADJUSTMENT, 3);
+    pidProfilesMutable(0)->pid[1].P += 9;
+    blackboxParamsOpEnd();
+
+    sim.events.clear();
+    runHeader();
+    runningLog();
+    drainJournal();
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    EXPECT_EQ(1, countRecords(j, 'C', "v"));
+    EXPECT_EQ(0, countRecords(j, 'M'));
+}
+
 // The stamp rule against a model of taskMainPidLoop() (core.c) for pid_process_denom 1-16: an operation
 // between two ticks, and which subtasks of which frame used the new value
 TEST(BlackboxParamsJournalTest, StampRuleForEveryDenominator)

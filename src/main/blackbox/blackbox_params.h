@@ -103,7 +103,7 @@ bool blackboxParamsHoldLogEnd(void);
 // Just before LOG_END: write the end record
 void blackboxParamsEnd(void);
 
-// SHUTTING_DOWN: the log is closed
+// SHUTTING_DOWN, FULL or START_ERASE: the log ended. Records that it did not get make the shadow invalid.
 void blackboxParamsStop(void);
 
 // S-frame paramSeq: the number of the last journal record of this log (0: none)
