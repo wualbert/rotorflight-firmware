@@ -477,8 +477,9 @@ static bbpPoint_t pointNow(void)
         return pointPre;
     }
     // Ticks 0..c-1 of this PID cycle have run. With c > b, blackboxUpdate of this cycle already advanced the
-    // iteration: the ticks that are left (flush, and the filter update with pid_process_denom 3, which acts on
-    // the next cycle) do not change the frame, which is new in all fields.
+    // iteration: the subtasks of the next frame with a tick up to b run after the change, so the point is N.0. A late
+    // subtask (tick after b: flush, and the filter update with pid_process_denom 3) acts on the next frame from the
+    // current cycle. For it, the stamp N.0 is uncertain in frame N, and N.c with c >= 1 is old in frame N (spec 2.5).
     const uint8_t c = getPidUpdateCounter();
     const bbpPoint_t point = { blackboxGetIteration(), (c <= coreSubtaskTick(CORE_ST_BLACKBOX)) ? c : 0 };
     return point;

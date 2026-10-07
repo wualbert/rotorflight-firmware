@@ -1888,7 +1888,8 @@ TEST(BlackboxParamsJournalTest, FullDeviceStopsTheJournal)
 }
 
 // The stamp rule against a model of taskMainPidLoop() (core.c) for pid_process_denom 1-16: an operation
-// between two ticks, and which subtasks of which frame used the new value
+// between two ticks, and which subtasks of which frame used the new value. Also the late subtasks (a tick after
+// blackboxUpdate: flush, and the filter update with pid_process_denom 3), with the rule that the reader applies.
 TEST(BlackboxParamsJournalTest, StampRuleForEveryDenominator)
 {
     // The tick of each subtask (pos, sp, pid, mix, mot, fupd, bb, flush) in core.c
@@ -1902,7 +1903,7 @@ TEST(BlackboxParamsJournalTest, StampRuleForEveryDenominator)
         { 0, 0, 1, 2, 3, 4, 5, 6 },     // 7
         { 0, 1, 2, 3, 4, 5, 6, 7 },     // 8 and more
     };
-    int checked = 0;
+    int checked = 0, uncertain = 0;
     for (int denom = 1; denom <= 16; denom++) {
         const uint8_t *ticks = schedule[MIN(denom, 8) - 1];
         const int b = ticks[CORE_ST_BLACKBOX];
@@ -1922,22 +1923,30 @@ TEST(BlackboxParamsJournalTest, StampRuleForEveryDenominator)
             const JRecord *r = findRecord(j, 'C', "m.1");
             ASSERT_NE(nullptr, r);
             ASSERT_FALSE(r->interval);
-            for (int cycle = 0; cycle < 3; cycle++) {
+            for (int frame = 0; frame < 4; frame++) {
                 for (int s = 0; s < CORE_ST_COUNT; s++) {
-                    // A subtask after blackboxUpdate in its cycle acts on the next frame, or not at all (flush)
-                    if (ticks[s] > b) {
+                    // A late subtask (after blackboxUpdate in its cycle) acts on the next frame: frame F has its run
+                    // of cycle F - 1. That run used the new value when it came after the write (cycle 1, tick c).
+                    const bool late = ticks[s] > b;
+                    const int cycle = late ? frame - 1 : frame;
+                    const bool used = cycle > 1 || (cycle == 1 && ticks[s] >= c);
+                    // The rule of the reader (spec 2.5)
+                    const uint32_t n = r->n1;
+                    const int stampTick = r->c1;
+                    if (late && (uint32_t)frame == n && stampTick == 0) {
+                        uncertain++;    // uncertain: either value is allowed
                         continue;
                     }
-                    const bool used = cycle > 1 || (cycle == 1 && ticks[s] >= c);
-                    const bool stamped = (uint32_t)cycle > r->n1 || ((uint32_t)cycle == r->n1 && ticks[s] >= (int)r->c1);
-                    EXPECT_EQ(used, stamped) << "denom " << denom << " c " << c << " cycle " << cycle << " subtask " << s << " at " << r->at;
+                    const bool stamped = late ? (uint32_t)frame > n
+                        : (uint32_t)frame > n || ((uint32_t)frame == n && ticks[s] >= stampTick);
+                    EXPECT_EQ(used, stamped) << "denom " << denom << " c " << c << " frame " << frame << " subtask " << s << " at " << r->at;
                     checked++;
                 }
             }
             EXPECT_LE((int)r->c1, b);
         }
     }
-    printf("stamp rule: %d subtask runs checked for pid_process_denom 1-16\n", checked);
+    printf("stamp rule: %d subtask runs checked for pid_process_denom 1-16, %d late runs uncertain\n", checked, uncertain);
 }
 
 // The scan: a write that no hook saw is found. Its interval starts where the previous pass of the group started.
