@@ -1607,6 +1607,49 @@ TEST(BlackboxParamsJournalTest, RingOverflowGivesLostThenResync)
         countRecords(j, 'C', "y"), lost->fields.at("pgs").c_str(), q->fields.at("lostrec").c_str());
 }
 
+// A change and its revert are both lost while the ring is full: the resync is a 'y' record without items, with an
+// interval from the last verified point of the group (spec 2.4)
+TEST(BlackboxParamsJournalTest, ItemlessResyncHasAnInterval)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    Decoded d = decodeHeader(runHeader());
+    runningLog();
+    sim.freeSpace = 0;
+    for (int i = 0; i < 100; i++) {
+        sim.iteration = 60 + i;
+        blackboxParamsOpBegin(BBP_SRC_MSP, 95);
+        pidProfilesMutable(i % PID_PROFILE_COUNT)->pid[i % 3].P += 1;
+        blackboxParamsOpEnd();
+    }
+    sim.iteration = 170;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 211);
+    governorConfigMutable()->gov_spoolup_time += 1;
+    blackboxParamsOpEnd();
+    sim.iteration = 171;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 211);
+    governorConfigMutable()->gov_spoolup_time -= 1;
+    blackboxParamsOpEnd();
+    sim.freeSpace = 100000;
+    drainJournal();
+
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    const std::string gov = std::to_string(PG_GOVERNOR_CONFIG);
+    const JRecord *y = NULL;
+    for (const JRecord &r : j.records) {
+        if (r.type == 'C' && r.fields.at("s") == "y" && r.fields.at("pgs") == gov) {
+            y = &r;
+        }
+    }
+    ASSERT_NE(nullptr, y);
+    EXPECT_EQ(0u, y->items.size());
+    EXPECT_TRUE(y->interval) << y->at;
+    EXPECT_LT(y->n0, 171u) << "the interval starts before the revert";
+    std::vector<std::string> errors;
+    applyJournal(d, j, errors);
+    expectStateIsLive(d);
+}
+
 // Before T0 every stamp is 'p'. Changes between two logs are 'v' records. After the CLI, 'M shadow-reset'.
 TEST(BlackboxParamsJournalTest, BeforeT0AndBetweenLogs)
 {

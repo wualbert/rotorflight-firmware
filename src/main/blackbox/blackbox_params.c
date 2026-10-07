@@ -838,10 +838,9 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
 
         if (!groupDiffers(t, start & ~3, end) || !diffGroup(t, start & ~3, end, map)) {
             if (whole) {
-                bbpVerified[t] = at;
-                bbp.prevMask &= ~BIT(t);
                 if (bbp.lostMask & BIT(t)) {
-                    // The lost bytes are back at their recorded values: a 'y' record without items
+                    // The lost bytes are back at their recorded values: a 'y' record without items. Its interval
+                    // starts at the last verified point, before this one.
                     if (rec.open) {
                         recCommit();
                     }
@@ -851,6 +850,8 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
                         bbp.lostListed &= ~BIT(t);
                     }
                 }
+                bbpVerified[t] = at;
+                bbp.prevMask &= ~BIT(t);
             }
             continue;
         }
