@@ -209,6 +209,7 @@ static HeaderRun writeHeader(int budgetPerCall = 64)
     blackboxHeaderBudget = 0;
     blackboxParamsStart();
     for (int iteration = 0; iteration < 1000000; iteration++) {
+        blackboxParamsHeaderTick();
         blackboxHeaderBudget = MIN(blackboxHeaderBudget + budgetPerCall, 256);
         if (blackboxHeaderBudget < 64) {
             continue;
@@ -800,6 +801,7 @@ TEST(BlackboxParamsTest, CallTime)
         blackboxParamsStart();
         deviceBytes.clear();
         for (int call = 0; ; call++) {
+            blackboxParamsHeaderTick();
             blackboxHeaderBudget = 256;
             const auto start = std::chrono::steady_clock::now();
             const bool done = blackboxParamsWriteHeader();
@@ -1777,10 +1779,27 @@ TEST(BlackboxParamsJournalTest, LostRecordsGiveShadowReset)
     blackboxParamsStop();                       // log 1 ends with all its records
     pidProfilesMutable(0)->pid[0].P += 7;       // a change between the logs
 
-    // Log 2: the header compares groups ('v' records in the ring), then the pilot disarms before T0
+    // Log 2: the pilot disarms before the 'v' compare of the PID profiles has made its record. Nothing is lost:
+    // log 3 has the 'v' record.
     sim.events.clear();
     blackboxParamsStart();
-    for (int i = 0; i < 5; i++) {
+    blackboxParamsHeaderTick();
+    blackboxParamsStop();
+    sim.events.clear();
+    runHeader();
+    runningLog();
+    drainJournal();
+    Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    EXPECT_EQ(1, countRecords(j, 'C', "v"));
+    EXPECT_EQ(0, countRecords(j, 'M'));
+    blackboxParamsStop();
+    pidProfilesMutable(0)->pid[0].P += 7;
+
+    // Log 2b: the header compares the groups ('v' records in the ring), then the pilot disarms before T0
+    sim.events.clear();
+    blackboxParamsStart();
+    for (int i = 0; i < 100; i++) {
         blackboxParamsHeaderTick();
     }
     blackboxParamsStop();
@@ -1792,7 +1811,7 @@ TEST(BlackboxParamsJournalTest, LostRecordsGiveShadowReset)
     expectExact(d);
     runningLog();
     drainJournal();
-    Journal j = parseJournal(sim.events);
+    j = parseJournal(sim.events);
     expectNoErrors(j);
     const JRecord *m = findRecord(j, 'M');
     ASSERT_NE(nullptr, m);
@@ -1918,7 +1937,8 @@ TEST(BlackboxParamsJournalTest, ScanVerifiedPointIsTheStartOfThePass)
             steps += (pgSize(trackedReg(t)) + BBP_SCAN_BYTES - 1) / BBP_SCAN_BYTES;
         }
     }
-    // Pass 1 of PID_PROFILE (group 0) starts after frame 0: point 1.0. Pass 2 starts after frame 'steps'.
+    // Pass 1 of PID_PROFILE (group 0) starts after frame 0: point 1.0. Pass 2 starts after frame 'steps'. The scan
+    // finds the write after frame steps + chunk (point steps + 1 + chunk), and the capture records it in steps.
     for (int i = 0; i < steps + 3; i++) {
         logFrame();
     }
@@ -1935,8 +1955,12 @@ TEST(BlackboxParamsJournalTest, ScanVerifiedPointIsTheStartOfThePass)
     const JRecord *u = findRecord(j, 'C', "u");
     ASSERT_NE(nullptr, u);
     EXPECT_TRUE(u->interval);
-    // Not the end of pass 1, and not the start of pass 2: the start of pass 1, the last complete pass
-    EXPECT_EQ("1.0~" + std::to_string(steps + 1 + chunk) + ".0", u->at);
+    // Not the end of pass 1, and not the start of pass 2: the start of pass 1, the last complete pass. The end of
+    // the interval is the step of the capture that made the record.
+    EXPECT_EQ(1u, u->n0);
+    EXPECT_EQ(0u, u->c0);
+    EXPECT_GE(u->n1, (uint32_t)(steps + 1 + chunk));
+    EXPECT_LE(u->n1, (uint32_t)(steps + 1 + chunk + 16));
     printf("scan: one pass is %d logged iterations, write found in %s\n", steps, u->at.c_str());
 }
 
@@ -2028,6 +2052,175 @@ TEST(BlackboxParamsJournalTest, OperationTime)
     }
     printf("on this computer: operation with one change %.2f us, operation without a change %.2f us, "
         "PID task with an event %.2f us, idle PID task step %.3f us\n", best, bestEmpty, bestDrain, bestScan);
+}
+
+// Change every value of the PID profiles and the rate profiles
+static void changeAllProfiles(void)
+{
+    for (int k = 0; k < PID_PROFILE_COUNT; k++) {
+        uint8_t *p = (uint8_t *)pidProfilesMutable(k);
+        for (unsigned i = 16; i < sizeof(pidProfile_t); i++) {
+            p[i] ^= 1;
+        }
+    }
+    for (int k = 0; k < CONTROL_RATE_PROFILE_COUNT; k++) {
+        uint8_t *p = (uint8_t *)controlRateProfilesMutable(k);
+        for (unsigned i = 16; i < sizeof(controlRateConfig_t); i++) {
+            p[i] ^= 1;
+        }
+    }
+}
+
+// The slowest call of a sequence of calls in the PID task. The sequence runs again and again, and each call keeps
+// its best time (the host scheduler adds time to some calls), so the result is the cost of the slowest call.
+struct SlowestCall {
+    double us = 0;
+    int calls = 0;
+};
+
+static double untimedUs;
+
+// A part of a timed call that does not count
+static bool untimed(bool (*part)(void))
+{
+    const auto start = std::chrono::steady_clock::now();
+    const bool result = part();
+    untimedUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    return result;
+}
+
+static SlowestCall slowestCall(void (*setup)(void), bool (*call)(void))
+{
+    std::vector<double> best;
+    for (int run = 0; run < 20; run++) {
+        setup();
+        for (size_t i = 0; ; i++) {
+            untimedUs = 0;
+            const auto start = std::chrono::steady_clock::now();
+            const bool more = call();
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() - untimedUs;
+            if (i >= best.size()) {
+                best.push_back(us);
+            } else {
+                best[i] = std::min(best[i], us);
+            }
+            if (!more || i > 100000) {
+                break;
+            }
+        }
+    }
+    SlowestCall r;
+    if (getenv("BBP_DEBUG_SLOW")) {
+        std::vector<size_t> idx(best.size());
+        for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+        std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return best[a] > best[b]; });
+        for (int i = 0; i < 8 && i < (int)idx.size(); i++) printf("  call %zu: %.3f us\n", idx[i], best[idx[i]]);
+    }
+    r.us = *std::max_element(best.begin(), best.end());
+    r.calls = best.size();
+    return r;
+}
+
+// The worst cases of the PID task (spec 3.12): every value of the 6 PID profiles and the 6 rate profiles changed,
+// (a) between two logs: the 'v' compare in the header states, (b) by an operation that the ring does not take: the
+// resync after the overflow, (c) by a write that no hook saw: the scan. The host time of the slowest call, against
+// the operation without a change of OperationTime. The bench test (6.4) measures the target.
+TEST(BlackboxParamsJournalTest, WorstPidTaskCall)
+{
+    const SlowestCall header = slowestCall([](void) {
+        setupConfig(BLACKBOX_PARAMS_FULL);
+        runHeader();
+        runningLog();
+        drainJournal();
+        blackboxParamsStop();
+        changeAllProfiles();
+        sim.events.clear();
+        sim.running = false;
+        blackboxHeaderBudget = 0;
+        blackboxParamsStart();
+    }, [](void) {
+        // The header line of the same iteration is outside the time: CallTime measures it
+        blackboxParamsHeaderTick();
+        return blackboxParamsActive() && !untimed([](void) {
+            blackboxHeaderBudget = MIN(blackboxHeaderBudget + 64, 256);
+            return blackboxParamsWriteHeader();
+        });
+    });
+
+    const SlowestCall resync = slowestCall([](void) {
+        setupConfig(BLACKBOX_PARAMS_FULL);
+        runHeader();
+        runningLog();
+        drainJournal();
+        sim.freeSpace = 0;
+        blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+        changeAllProfiles();
+        blackboxParamsOpEnd();
+        sim.freeSpace = 100000;
+    }, [](void) {
+        logFrame();
+        return blackboxParamsHoldLogEnd() || sim.iteration < 4000;
+    });
+
+    const SlowestCall scan = slowestCall([](void) {
+        setupConfig(BLACKBOX_PARAMS_FULL);
+        runHeader();
+        runningLog();
+        drainJournal();
+        changeAllProfiles();
+    }, [](void) {
+        logFrame();
+        return blackboxParamsHoldLogEnd() || sim.iteration < 4000;
+    });
+
+    // For comparison: the drain of records that wait, without a capture (an event of up to 128 chars each call)
+    const SlowestCall drain = slowestCall([](void) {
+        setupConfig(BLACKBOX_PARAMS_FULL);
+        runHeader();
+        runningLog();
+        drainJournal();
+        sim.freeSpace = 0;
+        for (int i = 0; i < 12; i++) {
+            blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+            for (int a = 0; a < 3; a++) {
+                pidProfilesMutable(i % PID_PROFILE_COUNT)->pid[a].P += 1;
+                pidProfilesMutable(i % PID_PROFILE_COUNT)->pid[a].I += 1;
+            }
+            blackboxParamsOpEnd();
+        }
+        sim.freeSpace = 100000;
+    }, [](void) {
+        logFrame();
+        return blackboxParamsHoldLogEnd();
+    });
+
+    // The state is exact after each case
+    for (int c = 0; c < 2; c++) {
+        setupConfig(BLACKBOX_PARAMS_FULL);
+        Decoded d = decodeHeader(runHeader());
+        runningLog();
+        if (c == 0) {
+            sim.freeSpace = 0;
+            blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+        }
+        changeAllProfiles();
+        if (c == 0) {
+            blackboxParamsOpEnd();
+            sim.freeSpace = 100000;
+        }
+        drainJournal();
+        const Journal j = parseJournal(sim.events);
+        expectNoErrors(j);
+        std::vector<std::string> errors;
+        applyJournal(d, j, errors);
+        for (const std::string &e : errors) {
+            ADD_FAILURE() << e;
+        }
+        expectStateIsLive(d);
+    }
+
+    printf("slowest PID task call on this computer: header 'v' %.2f us (%d calls), resync %.2f us, scan 'u' %.2f us; "
+        "drain only %.2f us\n", header.us, header.calls, resync.us, scan.us, drain.us);
 }
 
 // Markers, and a loader outside an operation

@@ -89,6 +89,7 @@
 #define BBP_RESYNC_FREE     256     // ring bytes free before a resync after an overflow
 #define BBP_DIFF_WORDS      8       // changed-word bitmap: a group of at most 1024 B
 #define BBP_ARG_PART        0x8000  // ring arg of a 'y' record (the pgn): the record does not complete the group
+#define BBP_STEP_UNITS      128     // work of one capture step in the PID task (units of about 10 cycles, spec 3.7)
 
 STATIC_ASSERT((BBP_RING_SIZE & (BBP_RING_SIZE - 1)) == 0, bbp_ring_size_power_of_2);
 
@@ -192,6 +193,30 @@ static struct {
     uint16_t    count;
 } rec;
 
+// A walk of the changed words of a group (capture): its stage and position
+enum {
+    WALK_COMPARE = 0,               // the steps of the PID task only: the compare, into the bitmap
+    WALK_NAMED,
+    WALK_ELEMENTS,
+    WALK_RAW,
+    WALK_DONE
+};
+
+typedef struct {
+    uint8_t     stage;
+    uint8_t     k;                  // named: the instance
+    uint16_t    i;                  // compare, raw: the byte. Named: the valueTable entry. Elements: the element.
+    int32_t     budget;             // work units left
+} walk_t;
+
+// The capture of one group in the PID task, in steps (stepGroup)
+static struct {
+    int8_t      t;                  // the group, -1: none
+    bbpPoint_t  compared;           // the point of the compare: the verified point when the walk is done
+    walk_t      walk;
+    uint32_t    map[BBP_DIFF_WORDS];
+} step;
+
 /* Tracked groups */
 
 // bbpTrackedIndex(): the last group that it looked for. valueTable is grouped by parameter group.
@@ -239,6 +264,7 @@ void blackboxParamsInit(void)
     }
     cachedPgn = BBP_NONE;
     bbp.systemIndex = bbpTrackedIndex(PG_SYSTEM_CONFIG);
+    step.t = -1;
 
     bbpPgAllInHeader = 0;
     uint32_t tooLong = 0;
@@ -334,16 +360,12 @@ static bool groupDiffers(int t, unsigned start, unsigned end)
     return false;
 }
 
-// Compare bytes start..end-1 of group t with the shadow. Bit w of map: bytes 4w..4w+3 differ.
-static bool diffGroup(int t, unsigned start, unsigned end, uint32_t *map)
+// Compare bytes start..end-1 of group t with the shadow, into map. Bit w of map: bytes 4w..4w+3 differ.
+static bool diffRange(int t, unsigned start, unsigned end, uint32_t *map)
 {
     const uint8_t *live = bbpPg[t].reg->address;
     const uint8_t *shadow = bbpShadow(t);
     uint32_t any = 0;
-
-    for (int i = 0; i < BBP_DIFF_WORDS; i++) {
-        map[i] = 0;
-    }
 
     unsigned w = start / 4;
     if (bbp.wordMask & BIT(t)) {
@@ -379,11 +401,31 @@ static bool diffGroup(int t, unsigned start, unsigned end, uint32_t *map)
     return any;
 }
 
-// A changed word covers some of the bytes offset..offset+width-1
+static void clearMap(uint32_t *map)
+{
+    for (int i = 0; i < BBP_DIFF_WORDS; i++) {
+        map[i] = 0;
+    }
+}
+
+static bool diffGroup(int t, unsigned start, unsigned end, uint32_t *map)
+{
+    clearMap(map);
+    return diffRange(t, start, end, map);
+}
+
+// A changed word covers some of the bytes offset..offset+width-1. One test for each bitmap word (128 B).
 static bool mapHas(const uint32_t *map, unsigned offset, unsigned width)
 {
-    for (unsigned w = offset / 4; w <= (offset + width - 1) / 4; w++) {
-        if (map[w / 32] & BIT(w % 32)) {
+    const unsigned first = offset / 4;
+    const unsigned last = (offset + width - 1) / 4;
+
+    for (unsigned w = first; w <= last; w = (w | 31) + 1) {
+        uint32_t bits = map[w / 32] >> (w % 32);
+        if (last - w < 31) {
+            bits &= (2u << (last - w)) - 1;
+        }
+        if (bits) {
             return true;
         }
     }
@@ -659,8 +701,29 @@ static bool stringIsText(const uint8_t *p, unsigned length)
     return i == length;
 }
 
+/*
+ * The walks: the items of the changed words of group t, bytes start..end-1, in three stages. A walk has a budget of
+ * work units (about 10 cycles each on a Cortex-M4). When the budget ends, the walk keeps its position and stops; the
+ * next call goes on from there. A capture outside the PID task has no limit.
+ */
+#define BBP_COST_BLOCK      11      // the compare of 32 B (block compare, and the bitmap of a changed block)
+#define BBP_COST_ENTRY      8       // a valueTable entry of a changed instance
+#define BBP_COST_ITEM       12      // an item into the ring
+#define BBP_COST_ELEMENT    3       // an element
+#define BBP_COST_FORMAT     100     // a changed element: its text is formatted to test its length
+#define BBP_COST_RAW_BYTE   1       // a byte of a changed word in the raw walk, or of a raw item
+#define BBP_NO_LIMIT        INT32_MAX
+
+static void walkBegin(walk_t *w, int t, int32_t budget)
+{
+    w->stage = WALK_NAMED;
+    w->k = 0;
+    w->i = bbpPg[t].vtFirst;
+    w->budget = budget;
+}
+
 // Values that the CLI names: one item for each changed value, or each changed element of an array
-static bool walkNamed(int t, const uint32_t *map, unsigned start, unsigned end)
+static bool walkNamed(int t, const uint32_t *map, unsigned start, unsigned end, walk_t *w)
 {
     const pgRegistry_t *reg = bbpPg[t].reg;
     const pgn_t pgn = pgN(reg);
@@ -670,13 +733,19 @@ static bool walkNamed(int t, const uint32_t *map, unsigned start, unsigned end)
 
     // Instance k: the profile values of profile k. Instance 0 also has the other values (offsets in the whole
     // group). A profile without a changed word costs one bitmap test.
-    for (unsigned k = 0; k < reg->length; k++) {
+    for (; w->k < reg->length; w->k++, w->i = bbpPg[t].vtFirst) {
+        const unsigned k = w->k;
         const unsigned base = k * elementSize;
         const bool profileChanged = base < end && base + elementSize > start && mapHas(map, base, elementSize);
         if (!profileChanged && (k > 0 || (bbp.profileOnlyMask & BIT(t)))) {
             continue;
         }
-        for (unsigned i = bbpPg[t].vtFirst; i < bbpPg[t].vtEnd; i++) {
+        for (; w->i < bbpPg[t].vtEnd; w->i++) {
+            if (w->budget <= 0) {
+                return true;
+            }
+            w->budget -= BBP_COST_ENTRY;
+            const unsigned i = w->i;
             const clivalue_t *v = &valueTable[i];
             if (v->pgn != pgn) {
                 continue;
@@ -706,19 +775,28 @@ static bool walkNamed(int t, const uint32_t *map, unsigned start, unsigned end)
                         return false;
                     }
                     writeBytes(shadow + offset, size, (shadowWord & ~bit) | (liveWord & bit));
+                    w->budget -= BBP_COST_ITEM;
                 }
             } else if (mode == MODE_ARRAY) {
                 for (unsigned e = 0; e < v->config.array.length; e++) {
                     const unsigned at = offset + e * size;
-                    if (bytesDiffer(live + at, shadow + at, size) && !itemFromLive(t, i, slot, e, at, size)) {
-                        return false;
+                    if (bytesDiffer(live + at, shadow + at, size)) {
+                        if (!itemFromLive(t, i, slot, e, at, size)) {
+                            return false;
+                        }
+                        w->budget -= BBP_COST_ITEM;
                     }
                 }
-            } else if (bytesDiffer(live + offset, shadow + offset, width) && !itemFromLive(t, i, slot, BBP_SLOT_NONE, offset, width)) {
-                return false;
+            } else if (bytesDiffer(live + offset, shadow + offset, width)) {
+                if (!itemFromLive(t, i, slot, BBP_SLOT_NONE, offset, width)) {
+                    return false;
+                }
+                w->budget -= BBP_COST_ITEM;
             }
         }
     }
+    w->stage = WALK_ELEMENTS;
+    w->i = 0;
     return true;
 }
 
@@ -731,7 +809,7 @@ static bool elementItemFits(uint16_t code, const uint8_t *newBytes, const uint8_
 }
 
 // Elements (servo, mixer input and rule, rx failsafe, features) and the profile indices of SYSTEM_CONFIG
-static bool walkElements(int t, const uint32_t *map, unsigned start, unsigned end)
+static bool walkElements(int t, const uint32_t *map, unsigned start, unsigned end, walk_t *w)
 {
     const pgRegistry_t *reg = bbpPg[t].reg;
     const uint8_t *live = reg->address;
@@ -741,7 +819,12 @@ static bool walkElements(int t, const uint32_t *map, unsigned start, unsigned en
     if (kind) {
         const unsigned size = pgElementSize(reg);
         const unsigned count = kind->indexed ? reg->length : 1;
-        for (unsigned i = 0; i < count; i++) {
+        for (; w->i < count; w->i++) {
+            if (w->budget <= 0) {
+                return true;
+            }
+            w->budget -= BBP_COST_ELEMENT;
+            const unsigned i = w->i;
             const unsigned offset = i * size;
             if (offset < start || offset + size > end || !mapHas(map, offset, size)) {
                 continue;
@@ -751,13 +834,18 @@ static bool walkElements(int t, const uint32_t *map, unsigned start, unsigned en
                 const unsigned at = offset + kind->fields[f].offset;
                 differs = differs || bytesDiffer(live + at, shadow + at, bbpFieldWidth(&kind->fields[f]));
             }
+            if (!differs) {
+                continue;
+            }
+            w->budget -= BBP_COST_FORMAT;
             const uint16_t code = BBP_CODE_ELEMENT | (unsigned)(kind - bbpElementKinds) << 8 | i;
-            if (!differs || !elementItemFits(code, live + offset, shadow + offset, size)) {
+            if (!elementItemFits(code, live + offset, shadow + offset, size)) {
                 continue;   // too long: raw items
             }
             if (!recItem(code, BBP_SLOT_NONE, BBP_SLOT_NONE, live + offset, shadow + offset, size)) {
                 return false;
             }
+            w->budget -= BBP_COST_ITEM;
             // The fields only: other bytes of the element are raw items
             for (int f = 0; f < kind->fieldCount; f++) {
                 const unsigned at = offset + kind->fields[f].offset;
@@ -781,16 +869,18 @@ static bool walkElements(int t, const uint32_t *map, unsigned start, unsigned en
             }
         }
     }
+    w->stage = WALK_RAW;
+    w->i = start;
     return true;
 }
 
 // Bytes that still differ: items of at most 16 bytes
-static bool walkRaw(int t, const uint32_t *map, unsigned start, unsigned end)
+static bool walkRaw(int t, const uint32_t *map, unsigned end, walk_t *w)
 {
     const uint8_t *live = bbpPg[t].reg->address;
     const uint8_t *shadow = bbpShadow(t);
 
-    for (unsigned i = start; i < end; ) {
+    for (unsigned i = w->i; i < end; ) {
         const uint32_t bits = map[i / 128] >> ((i / 4) % 32);
         if (!bits) {
             i = (i | 127) + 1;      // no changed word in the rest of this bitmap word
@@ -800,6 +890,11 @@ static bool walkRaw(int t, const uint32_t *map, unsigned start, unsigned end)
             i = (i | 3) + 1;
             continue;
         }
+        if (w->budget <= 0) {
+            w->i = i;
+            return true;
+        }
+        w->budget -= BBP_COST_RAW_BYTE;
         if (live[i] == shadow[i]) {
             i++;
             continue;
@@ -813,9 +908,173 @@ static bool walkRaw(int t, const uint32_t *map, unsigned start, unsigned end)
         if (!itemFromLive(t, BBP_CODE_RAW | t, i & 0xFF, i >> 8, i, last - i + 1)) {
             return false;
         }
+        w->budget -= BBP_COST_ITEM + 2 * BBP_RAW_ITEM_BYTES;
         i = last + 1;
     }
+    w->stage = WALK_DONE;
     return true;
+}
+
+// Walk until the walk is done or the budget ends. False: an item did not fit in the ring.
+static bool walkGroup(int t, const uint32_t *map, unsigned start, unsigned end, walk_t *w)
+{
+    while (w->stage != WALK_DONE && w->budget > 0) {
+        bool fits;
+        switch (w->stage) {
+        case WALK_NAMED:
+            fits = walkNamed(t, map, start, end, w);
+            break;
+        case WALK_ELEMENTS:
+            fits = walkElements(t, map, start, end, w);
+            break;
+        default:
+            fits = walkRaw(t, map, end, w);
+            break;
+        }
+        if (!fits) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The state of a group after a compare */
+
+// The whole group was equal to the shadow at 'verified', and is at 'at'
+static void groupEqual(int t, bbpPoint_t at, bbpPoint_t verified)
+{
+    if (bbp.lostMask & BIT(t)) {
+        // The lost bytes are back at their recorded values: a 'y' record without items. Its interval starts at the
+        // last verified point, before this one.
+        if (rec.open) {
+            recCommit();
+        }
+        if (recBegin('C', 'y', pgN(bbpPg[t].reg), intervalStart(t, at), at)) {
+            recCommit();
+            bbp.lostMask &= ~BIT(t);
+            bbp.lostListed &= ~BIT(t);
+        }
+    }
+    bbpVerified[t] = verified;
+    bbp.prevMask &= ~BIT(t);
+}
+
+// All differences of the group are recorded. The group was equal to the shadow at 'verified'.
+static void groupSynced(int t, bbpPoint_t verified)
+{
+    bbpVerified[t] = verified;
+    bbp.prevMask &= ~BIT(t);
+    bbp.lostMask &= ~BIT(t);
+    bbp.lostListed &= ~BIT(t);
+}
+
+// The ring did not take all differences of the group: the PID task writes 'L', then 'y' records
+static void groupLost(int t, bbpPoint_t at)
+{
+    if (!(bbp.lostMask & ~bbp.lostListed)) {
+        bbp.lostAt = at;
+    }
+    bbp.lostMask |= BIT(t);
+    bbp.prevMask &= ~BIT(t);
+}
+
+static bool mapEmpty(const uint32_t *map)
+{
+    for (int i = 0; i < BBP_DIFF_WORDS; i++) {
+        if (map[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int lowestBit(uint32_t mask)
+{
+    return __builtin_ctz(mask);
+}
+
+/*
+ * The capture of a group in the PID task, in steps with a limit of work (spec 3.7, 3.12). The compare of the group goes
+ * into the bitmap in blocks of 32 B, then the walk makes the items. A step with items is a record of its own (u, v
+ * or y, with an interval from the last verified point of the group), and a 'y' record that does not complete the
+ * group has part=1. When the walk is done, the group was equal to the shadow at the point of the compare. Any other
+ * capture of the group stops the steps: its own record has the differences that are left.
+ * True when the capture of group t is complete.
+ */
+static bool stepGroup(int t, bbpPoint_t at, int32_t *budget)
+{
+    const pgRegistry_t *reg = bbpPg[t].reg;
+    const unsigned size = pgSize(reg);
+
+    if (step.t != t) {
+        step.t = t;
+        step.compared = at;
+        clearMap(step.map);
+        step.walk.stage = WALK_COMPARE;
+        step.walk.i = 0;
+    }
+    step.walk.budget = *budget;
+
+    if (step.walk.stage == WALK_COMPARE) {
+        while (step.walk.i < size && step.walk.budget > 0) {
+            const unsigned next = MIN(step.walk.i + 32u, size);
+            diffRange(t, step.walk.i, next, step.map);
+            step.walk.i = next;
+            step.walk.budget -= BBP_COST_BLOCK;
+        }
+        *budget = step.walk.budget;
+        if (step.walk.i < size) {
+            return false;
+        }
+        if (mapEmpty(step.map)) {
+            step.t = -1;
+            groupEqual(t, at, step.compared);
+            return true;
+        }
+        walkBegin(&step.walk, t, 0);
+        if (*budget <= 0) {
+            return false;
+        }
+        step.walk.budget = *budget;
+    }
+
+    const char s = (bbp.lostMask & BIT(t)) ? 'y' : (bbp.prevMask & BIT(t)) ? 'v' : 'u';
+    if (!recBegin('C', s, (s == 'y') ? pgN(reg) : BBP_ARG_NONE, intervalStart(t, at), at)) {
+        step.t = -1;
+        groupLost(t, at);
+        return true;
+    }
+    const bool fits = walkGroup(t, step.map, 0, size, &step.walk);
+    *budget = step.walk.budget;
+    if (!fits) {
+        step.t = -1;
+        recCommit();
+        groupLost(t, at);
+        return true;
+    }
+    if (step.walk.stage != WALK_DONE) {
+        rec.partial = true;
+        recCommit();
+        return false;
+    }
+    step.t = -1;
+    recCommit();
+    groupSynced(t, step.compared);
+    return true;
+}
+
+// One step of work on the groups in mask, the capture in progress first, while the budget and the ring allow
+static void stepGroups(uint32_t mask, bbpPoint_t at, unsigned ringFreeMin)
+{
+    int32_t budget = BBP_STEP_UNITS;
+
+    while (budget > 0 && ringFree() >= ringFreeMin) {
+        const int t = (step.t >= 0) ? step.t : mask ? lowestBit(mask) : -1;
+        if (t < 0 || !stepGroup(t, at, &budget)) {
+            return;
+        }
+        mask &= ~BIT(t);
+    }
 }
 
 /*
@@ -834,6 +1093,9 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
         if (!(set & BIT(t))) {
             continue;
         }
+        if (step.t == t) {
+            step.t = -1;
+        }
         const pgRegistry_t *reg = bbpPg[t].reg;
         const bool whole = (slot < 0 || t != slotGroup);
         const unsigned start = whole ? 0 : slot * pgElementSize(reg);
@@ -841,20 +1103,7 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
 
         if (!groupDiffers(t, start & ~3, end) || !diffGroup(t, start & ~3, end, map)) {
             if (whole) {
-                if (bbp.lostMask & BIT(t)) {
-                    // The lost bytes are back at their recorded values: a 'y' record without items. Its interval
-                    // starts at the last verified point, before this one.
-                    if (rec.open) {
-                        recCommit();
-                    }
-                    if (recBegin('C', 'y', pgN(reg), intervalStart(t, at), at)) {
-                        recCommit();
-                        bbp.lostMask &= ~BIT(t);
-                        bbp.lostListed &= ~BIT(t);
-                    }
-                }
-                bbpVerified[t] = at;
-                bbp.prevMask &= ~BIT(t);
+                groupEqual(t, at, at);
             }
             continue;
         }
@@ -872,15 +1121,14 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
             goto lost;
         }
 
-        if (!walkNamed(t, map, start, end) || !walkElements(t, map, start, end) || !walkRaw(t, map, start, end)) {
+        walk_t w;
+        walkBegin(&w, t, BBP_NO_LIMIT);
+        if (!walkGroup(t, map, start, end, &w)) {
             goto lost;
         }
 
         if (whole) {
-            bbpVerified[t] = at;
-            bbp.prevMask &= ~BIT(t);
-            bbp.lostMask &= ~BIT(t);
-            bbp.lostListed &= ~BIT(t);
+            groupSynced(t, at);
         }
         if (own) {
             recCommit();
@@ -894,21 +1142,20 @@ lost:
     // then a 'y' record for each group. A 'y' record of a group that is lost already gets "part=1", so its 'L'
     // stays open.
     recCommit();
-    if (!(bbp.lostMask & ~bbp.lostListed)) {
-        bbp.lostAt = at;
-    }
-    bbp.lostMask |= BIT(t);
+    groupLost(t, at);
     for (t++; t < BBP_TRACKED; t++) {
         if (set & BIT(t)) {
             const bool whole = (slot < 0 || t != slotGroup);
             const unsigned start = whole ? 0 : slot * pgElementSize(bbpPg[t].reg);
             const unsigned end = whole ? pgSize(bbpPg[t].reg) : start + pgElementSize(bbpPg[t].reg);
+            if (step.t == t) {
+                step.t = -1;
+            }
             if (groupDiffers(t, start & ~3, end)) {
-                bbp.lostMask |= BIT(t);
+                groupLost(t, at);
             }
         }
     }
-    bbp.prevMask &= ~bbp.lostMask;
 }
 
 /* Operations */
@@ -1303,20 +1550,10 @@ static void writeLost(void)
     }
 }
 
-static void resyncOneGroup(bbpPoint_t now)
-{
-    for (int t = 0; t < BBP_TRACKED; t++) {
-        if (bbp.lostMask & BIT(t)) {
-            capture(false, 'y', BBP_ARG_NONE, now, BIT(t), -1, -1);
-            return;
-        }
-    }
-}
-
 /*
  * Compare BBP_SCAN_BYTES of one group with the shadow. A group that is larger than the step is compared over
  * more than one logged iteration: its verified point becomes the point at which the pass started.
- * A difference is a write that no hook saw: a 'u' record with an interval.
+ * A difference is a write that no hook saw: 'u' records with an interval, in steps.
  */
 static void scanStep(bbpPoint_t now)
 {
@@ -1336,7 +1573,8 @@ static void scanStep(bbpPoint_t now)
     const unsigned end = MIN(bbp.scanOff + (unsigned)BBP_SCAN_BYTES, size);
 
     if (groupDiffers(t, bbp.scanOff, end)) {
-        capture(false, 'u', BBP_ARG_NONE, now, BIT(t), -1, -1);
+        // A capture in steps: the next logged iterations go on with it
+        stepGroups(BIT(t), now, 0);
         bbp.scanOff = size;
     } else if (end >= size) {
         if (pointAfter(bbp.scanPassStart, bbpVerified[t])) {
@@ -1384,9 +1622,10 @@ void blackboxParamsAfterFrame(void)
 
     drainOneEvent();
 
-    if (bbp.lostMask && ringFree() >= BBP_RESYNC_FREE) {
-        resyncOneGroup(now);
-    } else if (!bbp.lostMask) {
+    // One step of a capture, or of the resync of the lost groups, or of the scan
+    if (step.t >= 0 || bbp.lostMask) {
+        stepGroups(bbp.lostMask, now, BBP_RESYNC_FREE);
+    } else {
         scanStep(now);
     }
 
@@ -1435,6 +1674,7 @@ static void clearJournal(void)
     bbp.drainStarted = false;
     bbp.holding = false;
     rec.open = false;
+    step.t = -1;
 }
 
 void blackboxParamsStart(void)
@@ -1471,10 +1711,11 @@ void blackboxParamsStart(void)
     bbpHeaderBegin(mode != BLACKBOX_PARAMS_CHANGES);
 }
 
+// One step of the 'v' compare in each header iteration. The section ends after the compare.
 void blackboxParamsHeaderTick(void)
 {
     if (bbp.active && bbp.prevMask) {
-        capture(false, 'v', BBP_ARG_NONE, pointPre, bbp.prevMask & -bbp.prevMask, -1, -1);
+        stepGroups(bbp.prevMask, pointPre, 0);
     }
 }
 
@@ -1487,7 +1728,8 @@ bool blackboxParamsWriteHeader(void)
     if (bbp.linePos >= bbp.lineLength) {
         const int length = bbpHeaderNextLine(bbpLine);
         if (length < 0) {
-            return true;
+            // The 'v' compare is in the PID task, in steps: T0 waits for it
+            return !bbp.prevMask;
         }
         bbp.lineLength = length;
         bbp.linePos = 0;
