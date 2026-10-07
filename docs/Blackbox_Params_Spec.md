@@ -1,6 +1,6 @@
 # RF-PARAM-1: exact parameter provenance in Rotorflight 4.6 blackbox logs (final merged specification)
 
-Status: final design, not built. Date: 2026-10-06.
+Status: implemented on branch `blackbox-param-journal` (unit, audit and SITL end-to-end tests pass; not yet run on hardware). See `Blackbox_Params_Testing.md`. Date: 2026-10-06.
 
 - **Firmware base.** Rotorflight 4.6.0, tag `release/4.6.0` = `118e912`, clone `scratchpad/src/fw-4.6.0`. Firmware paths are relative to `src/main/` unless a path says otherwise.
 - **Viewer.** `/Users/albertwu/exp/rotorflight-blackbox`.
