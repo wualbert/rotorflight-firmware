@@ -2247,8 +2247,9 @@ void blackboxUpdate(timeUs_t currentTimeUs)
             blackboxSetState(BLACKBOX_STATE_RUNNING);
 
             blackboxLogIteration(currentTimeUs);
-        } else {
-            // The parameter journal goes on while paused
+        } else if (blackboxLoggedAnyFrames) {
+            // The parameter journal goes on while paused. Not before the first frame: a decoder drops the events
+            // before the first I-frame.
             blackboxParamsAfterFrame();
         }
         // Keep the logging timers ticking so our log iteration continues to advance
