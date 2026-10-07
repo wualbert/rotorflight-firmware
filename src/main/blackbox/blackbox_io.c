@@ -685,6 +685,12 @@ int32_t blackboxDeviceFreeSpace(void)
     return freeSpace;
 }
 
+// The header goes slower than BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION: a serial logger below 1 Mbaud (6000 B/s)
+bool blackboxHeaderRateLimited(void)
+{
+    return blackboxMaxHeaderBytesPerIteration < BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION;
+}
+
 /**
  * Call once every loop iteration in order to maintain the global blackboxHeaderBudget with the number of bytes we can
  * transmit this iteration.

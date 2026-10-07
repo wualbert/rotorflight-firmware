@@ -1685,7 +1685,12 @@ static void clearJournal(void)
 
 void blackboxParamsStart(void)
 {
-    const uint8_t mode = blackboxConfig()->params;
+    uint8_t mode = blackboxConfig()->params;
+
+    // The FULL snapshot (about 15 KB) at 6000 B/s would add more than 2 s without frames after arming: CHANGES
+    if (mode == BLACKBOX_PARAMS_FULL && blackboxHeaderRateLimited()) {
+        mode = BLACKBOX_PARAMS_CHANGES;
+    }
 
     clearJournal();
     bbpChanges++;

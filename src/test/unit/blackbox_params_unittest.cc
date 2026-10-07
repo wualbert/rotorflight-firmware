@@ -80,6 +80,7 @@ extern "C" {
     bool blackboxIsLogRunning(void);
     void blackboxLogCustomString(const char *ptr);
     int32_t blackboxDeviceFreeSpace(void);
+    bool blackboxHeaderRateLimited(void);
     uint8_t coreSubtaskTick(coreSubtask_e subtask);
     uint8_t getPidUpdateCounter(void);
     int getGovernorMode(void);
@@ -104,6 +105,7 @@ static struct {
     uint8_t counter;                    // getPidUpdateCounter()
     uint8_t ticks[CORE_ST_COUNT];       // coreSubtaskTick()
     int32_t freeSpace;                  // blackboxDeviceFreeSpace()
+    bool rateLimited;                   // blackboxHeaderRateLimited()
     timeMs_t millis;
     int govMode;
     uint32_t fpPid, fpGov, fpSp;
@@ -119,6 +121,7 @@ uint32_t blackboxGetIteration(void) { return sim.iteration; }
 bool blackboxIsLogRunning(void) { return sim.running; }
 void blackboxLogCustomString(const char *ptr) { sim.events.push_back(ptr); }
 int32_t blackboxDeviceFreeSpace(void) { return sim.freeSpace; }
+bool blackboxHeaderRateLimited(void) { return sim.rateLimited; }
 uint8_t coreSubtaskTick(coreSubtask_e subtask) { return sim.ticks[subtask]; }
 uint8_t getPidUpdateCounter(void) { return sim.counter; }
 int getGovernorMode(void) { return sim.govMode; }
@@ -143,6 +146,7 @@ static void resetSim(void)
     sim.counter = 0;
     memcpy(sim.ticks, ticksDenom2, sizeof(sim.ticks));
     sim.freeSpace = 100000;
+    sim.rateLimited = false;
     sim.millis = 1000;
     sim.govMode = 0;
     sim.fpPid = 0x1111;
@@ -727,6 +731,18 @@ TEST(BlackboxParamsTest, ChangesHasMetaLinesOnly)
     EXPECT_EQ((unsigned)d.lines, d.endLines);
     EXPECT_EQ(d.hash, d.endHash);
     printf("CHANGES header: %zu bytes, %d lines, %d calls\n", run.text.size(), d.lines + 1, run.calls);
+}
+
+// A serial logger below 1 Mbaud (6000 B/s): FULL gives the CHANGES section
+TEST(BlackboxParamsTest, SlowSerialGivesChanges)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    sim.rateLimited = true;
+    const std::string slow = writeHeader().text;
+    setupConfig(BLACKBOX_PARAMS_CHANGES);
+    const std::string changes = writeHeader().text;
+    EXPECT_EQ(changes, slow);
+    EXPECT_NE(std::string::npos, slow.find("H param_mode:CHANGES\n"));
 }
 
 TEST(BlackboxParamsTest, ParamPgsListsTheTrackedGroups)
