@@ -630,7 +630,7 @@ static int countKeys(const Decoded &d, const char *prefix)
 
 TEST(BlackboxParamsTest, FormatterMatchesCli)
 {
-    alignas(4) uint8_t buf[64];
+    alignas(4) uint8_t buf[256];        // larger than any value (telemetry_sensors: 40 x 2 B)
     char cli[512];
     char text[512];
     int compared = 0;
