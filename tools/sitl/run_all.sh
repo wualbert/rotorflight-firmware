@@ -2,10 +2,13 @@
 # Build the SITL (if needed), configure a fresh eeprom.bin, start the SITL, the
 # sensor/RC feed and the blackbox capture, run one scenario, stop everything.
 #
-# Usage: tools/sitl/run_all.sh [-n NAME] [-s SCENARIO] [-d DENOM] [-- SCENARIO ARGS...]
+# Usage: tools/sitl/run_all.sh [-n NAME] [-s SCENARIO] [-d DENOM] [-c CLI]... [-e ELF] [-- SCENARIO ARGS...]
 #   NAME      output directory obj/sitl_runs/NAME (default: SCENARIO-<date>)
 #   SCENARIO  tools/sitl/scenario_SCENARIO.py (default: regrace)
 #   DENOM     blackbox rate = PID rate / DENOM (default 2: 500 Hz)
+#   CLI       a CLI line for configure.py, e.g. -c 'set blackbox_params = OFF' (repeat)
+#   ELF       another SITL binary (no build), e.g. the stock build of another worktree
+# The scenario gets the SITL process id in the environment (SITL_PID).
 #
 # Output in obj/sitl_runs/NAME/: blackbox.bbl (+ .chunks.csv), timeline.json,
 # capture.json, configure.json, sitl.log, feed.log, eeprom.bin.
@@ -19,13 +22,17 @@ ELF="$FW/obj/main/rotorflight_SITL.elf"
 SCENARIO=regrace
 NAME=""
 DENOM=2
+CLI=()
+OTHER_ELF=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -n) NAME="$2"; shift 2 ;;
         -s) SCENARIO="$2"; shift 2 ;;
         -d) DENOM="$2"; shift 2 ;;
+        -c) CLI+=(--cli "$2"); shift 2 ;;
+        -e) OTHER_ELF="$2"; shift 2 ;;
         --) shift; break ;;
-        *) echo "usage: $0 [-n NAME] [-s SCENARIO] [-d DENOM] [-- SCENARIO ARGS...]" >&2; exit 2 ;;
+        *) echo "usage: $0 [-n NAME] [-s SCENARIO] [-d DENOM] [-c CLI]... [-e ELF] [-- SCENARIO ARGS...]" >&2; exit 2 ;;
     esac
 done
 NAME="${NAME:-$SCENARIO-$(date +%Y%m%d-%H%M%S)}"
@@ -34,9 +41,14 @@ OUT="$FW/obj/sitl_runs/$NAME"
 log() { echo "run_all: $*" >&2; }
 
 # 1. build (make is incremental)
-log "building SITL"
-make -C "$FW" SITL ARM_SDK_DIR=/usr ARM_SDK_PREFIX= -j"$(nproc)" > "$FW/obj/sitl_build.log" 2>&1 \
-    || { tail -30 "$FW/obj/sitl_build.log" >&2; exit 1; }
+if [ -n "$OTHER_ELF" ]; then
+    ELF="$(cd "$(dirname "$OTHER_ELF")" && pwd)/$(basename "$OTHER_ELF")"
+    log "using $ELF (no build)"
+else
+    log "building SITL"
+    make -C "$FW" SITL ARM_SDK_DIR=/usr ARM_SDK_PREFIX= -j"$(nproc)" > "$FW/obj/sitl_build.log" 2>&1 \
+        || { tail -30 "$FW/obj/sitl_build.log" >&2; exit 1; }
+fi
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -62,7 +74,7 @@ FEED=$!; PIDS+=("$FEED")
 log "configuring"
 "$ELF" > boot1.log 2>&1 &
 SITL=$!; PIDS+=("$SITL")
-python3 "$TOOLS/configure.py" --denom "$DENOM" > configure.json
+python3 "$TOOLS/configure.py" --denom "$DENOM" "${CLI[@]}" > configure.json
 wait "$SITL" || true
 
 # 5. the test boot, with the blackbox capture
@@ -73,7 +85,7 @@ python3 "$TOOLS/capture.py" blackbox.bbl > capture.json &
 CAPTURE=$!; PIDS+=("$CAPTURE")
 
 log "running scenario $SCENARIO"
-python3 "$TOOLS/scenario_$SCENARIO.py" --sitl-log sitl.log --output timeline.json "$@" > /dev/null
+SITL_PID=$SITL python3 "$TOOLS/scenario_$SCENARIO.py" --sitl-log sitl.log --output timeline.json "$@" > /dev/null
 
 # 6. stop: the capture last, after the TCP data has arrived
 sleep 1

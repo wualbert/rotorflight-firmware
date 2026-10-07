@@ -14,6 +14,10 @@ calibration needs still, level IMU data). Applies, then saves, then reboots
     (blackbox_io.c); TCP has no baud rate.
   - Blackbox: device SERIAL, mode ARMED, --denom (default 2), grace period
     --grace (default 5 s), fields unchanged (the defaults of pg/blackbox.c).
+  - Each --cli LINE (for example "set blackbox_params = OFF" or
+    "set pid_process_denom = 4"), in the CLI after the MSP steps. Then CLI
+    "save" (saves and reboots) instead of MSP_REBOOT. The CLI output is in
+    the JSON ("cli").
 
 The defaults of a fresh eeprom.bin give the rest: FEATURE_RX_MSP (the SITL
 DEFAULT_RX_FEATURE), rcmap AETRC123, PID profile 1, no governor, no motor
@@ -43,6 +47,36 @@ def pwm_to_step(us):
     return (us - 1500) // 5    # fc/rc_modes.h: CHANNEL_VALUE_TO_STEP (int8, sent as u8)
 
 
+def cli_read(sock, until, timeout=5.0):
+    """Read CLI output until it ends with 'until' (the prompt) or the time is up."""
+    buf = b''
+    deadline = time.monotonic() + timeout
+    while not buf.endswith(until) and time.monotonic() < deadline:
+        sock.settimeout(max(0.01, deadline - time.monotonic()))
+        try:
+            chunk = sock.recv(4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode(errors='replace')
+
+
+def run_cli(sock, lines, save=True):
+    """Enter the CLI ('#'), run each line, then 'save' (the SITL saves and exits)."""
+    out = []
+    sock.sendall(b'#')
+    out.append(cli_read(sock, b'\r\n# '))
+    for line in lines:
+        sock.sendall(line.encode() + b'\r')
+        out.append(cli_read(sock, b'\r\n# '))
+    if save:
+        sock.sendall(b'save\r')
+        out.append(cli_read(sock, b'Rebooting', timeout=5.0))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--host', default='127.0.0.1')
@@ -51,6 +85,7 @@ def main():
     ap.add_argument('--arm-aux', type=int, default=0, help='aux channel index of the ARM switch (0 = AUX1)')
     ap.add_argument('--denom', type=int, default=2, help='blackbox rate = PID rate / denom')
     ap.add_argument('--grace', type=int, default=5, help='blackbox grace period, s')
+    ap.add_argument('--cli', action='append', default=[], help='a CLI line to run after the MSP steps (repeat)')
     ap.add_argument('--no-reboot', action='store_true')
     a = ap.parse_args()
 
@@ -106,7 +141,10 @@ def main():
         out['blackbox'] = fc.blackbox_config()
         out['status'] = fc.status()
 
-        if not a.no_reboot:
+        if a.cli:
+            out['cli'] = run_cli(fc.sock, a.cli + ['get blackbox_params', 'get pid_process_denom'], save=not a.no_reboot)
+            out['rebooted'] = not a.no_reboot
+        elif not a.no_reboot:
             fc.reboot()
             out['rebooted'] = True
 

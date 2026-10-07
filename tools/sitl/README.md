@@ -114,6 +114,25 @@ Result on stock 4.6.0 (with the SITL commits): one log, one header (roll P
 re-arm continues the same log (FLIGHT_MODE arm bit 0 -> 1, no new header);
 then DISARM and LOG_END.
 
+## Scenario `journal`
+
+`scenario_journal.py` (with `blackbox_params`, docs/Blackbox_Params_Spec.md
+6.3): roll and yaw sticks off centre, arm, roll P x2 and `--toggles` more
+roll P writes while armed, PID profile 2 and back (`MSP_SELECT_SETTING`),
+disarm, yaw P in the grace period, re-arm within 1 s, disarm,
+`MSP_EEPROM_WRITE` in the grace period, `LOG_END`. `--between`: writes with no
+log open, then a second log (`v` records). `--log2-idle`: no writes in the
+second log. `--kill-ms D`: `kill -9` of the SITL D ms after a write. Each
+write is in `timeline.json` with `write`, `truth` ({journal key: [old, new]}),
+the host time before and after (`t_sitl_send_us`, `t_sitl_reply_us`), the
+`MSP_STATUS` before it and the read-back.
+
+`run_all.sh -c LINE` runs CLI lines in `configure.py` (then `save`), for
+example `-c 'set blackbox_params = OFF'`. `-e ELF` uses another binary.
+`pid_process_denom` below 8 needs a lower fake gyro rate: the SITL has
+`MAX_PID_PROCESS_SPEED` 1000 (`target/common_pre.h`) and an 8 kHz fake gyro,
+so `validateAndFixGyroConfig()` sets 8 again.
+
 ## Limitations
 
 - Loop timing: the main loop sleeps 50 us after each `scheduler()` call (about
