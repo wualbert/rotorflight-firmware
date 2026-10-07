@@ -226,9 +226,8 @@ static HeaderRun writeHeader(int budgetPerCall = 64)
         EXPECT_LE((int)chunk.size(), budget);
         EXPECT_LE((int)chunk.size(), BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION);
         EXPECT_EQ(budget - (int)chunk.size(), blackboxHeaderBudget);
-        // At most one line in one call: a newline can only be the last byte
-        const size_t newline = chunk.find('\n');
-        EXPECT_TRUE(newline == std::string::npos || newline == chunk.size() - 1) << chunk;
+        // e2e proposal P1: the end of a line of the previous call, then up to BBP_HEADER_LINES_PER_ITERATION (4) lines
+        EXPECT_LE((int)std::count(chunk.begin(), chunk.end(), '\n'), 5) << chunk;
         if (done) {
             EXPECT_EQ(0u, chunk.size());
             break;
@@ -1782,6 +1781,58 @@ TEST(BlackboxParamsJournalTest, BeforeT0AndBetweenLogs)
     EXPECT_EQ("shadow-reset", m->words.at(0));
     EXPECT_EQ(1u, m->seq);
     EXPECT_EQ(0, countRecords(j, 'C'));
+}
+
+// e2e proposal P2: a loader that runs while no log is open gives an 'A' record stamped p at the next T0, after the 'v'
+// records, when its region has not changed since the run. A loader whose region changed after its run gives none.
+TEST(BlackboxParamsJournalTest, LoaderRunBetweenLogsGivesApplyAtT0)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    drainJournal();
+    blackboxParamsStop();
+
+    pidProfilesMutable(0)->pid[0].P += 7;           // a change with its loader run after it
+    blackboxParamsApplied(BBP_LOADER_PID, 0);
+    blackboxParamsApplied(BBP_LOADER_SETPOINT, 0);
+    controlRateProfilesMutable(0)->cyclic_ring += 3; // a change after the run of its loader
+
+    sim.events.clear();
+    Decoded d = decodeHeader(runHeader());
+    expectExact(d);
+    runningLog();
+    drainJournal();
+    Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    EXPECT_EQ(2, countRecords(j, 'C', "v"));
+    int pid = 0, sp = 0;
+    uint32_t lastV = 0, firstA = 0;
+    for (const JRecord &r : j.records) {
+        if (r.type == 'C') {
+            lastV = MAX(lastV, r.seq);
+        }
+        if (r.type == 'A') {
+            EXPECT_TRUE(r.pre);
+            ASSERT_FALSE(r.words.empty());
+            pid += r.words[0] == "pid/0";
+            sp += r.words[0].compare(0, 2, "sp") == 0;
+            firstA = firstA ? firstA : r.seq;
+        }
+    }
+    EXPECT_EQ(1, pid);
+    EXPECT_EQ(0, sp);
+    EXPECT_GT(firstA, lastV);
+
+    // The next log: no loader ran in between, so no 'A' record
+    blackboxParamsStop();
+    sim.events.clear();
+    runHeader();
+    runningLog();
+    drainJournal();
+    j = parseJournal(sim.events);
+    expectNoErrors(j);
+    EXPECT_EQ(0, countRecords(j, 'A'));
 }
 
 // A log that ends before its records are written: in a header state (an arm blip), or with records that wait. Their
