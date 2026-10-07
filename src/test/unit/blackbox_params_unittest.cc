@@ -2223,6 +2223,47 @@ TEST(BlackboxParamsJournalTest, WorstPidTaskCall)
         "drain only %.2f us\n", header.us, header.calls, resync.us, scan.us, drain.us);
 }
 
+// blackboxParamsChangeCount(): rc_adjustments.c skips the operation of a set that had no effect, while the count
+// stays the same. It changes with each change that a capture finds, each loader and each log start.
+TEST(BlackboxParamsJournalTest, ChangeCount)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader();
+    runningLog();
+    drainJournal();
+    uint32_t count = blackboxParamsChangeCount();
+
+    // A set that clamps to the stored value: no change
+    blackboxParamsOpBegin(BBP_SRC_ADJUSTMENT, 3);
+    controlRateProfilesMutable(0)->rcRates[0] = controlRateProfiles(0)->rcRates[0];
+    blackboxParamsOpEnd();
+    drainJournal();
+    EXPECT_EQ(count, blackboxParamsChangeCount());
+
+    blackboxParamsOpBegin(BBP_SRC_ADJUSTMENT, 3);
+    controlRateProfilesMutable(0)->rcRates[0] += 1;
+    blackboxParamsOpEnd();
+    EXPECT_NE(count, blackboxParamsChangeCount());
+    count = blackboxParamsChangeCount();
+
+    blackboxParamsApplied(BBP_LOADER_SETPOINT, 0);
+    EXPECT_NE(count, blackboxParamsChangeCount());
+    count = blackboxParamsChangeCount();
+
+    // A write that no hook saw: the scan finds it
+    controlRateProfilesMutable(1)->rcRates[1] += 1;
+    drainJournal();
+    for (int i = 0; i < 100; i++) {
+        logFrame();
+    }
+    EXPECT_NE(count, blackboxParamsChangeCount());
+    count = blackboxParamsChangeCount();
+
+    blackboxParamsStop();
+    blackboxParamsStart();
+    EXPECT_NE(count, blackboxParamsChangeCount());
+}
+
 // Markers, and a loader outside an operation
 TEST(BlackboxParamsJournalTest, MarkersAndLoaderOutsideAnOperation)
 {

@@ -127,6 +127,10 @@ void blackboxParamsMarker(bbpMarker_e marker, uint32_t a, uint32_t b);
 // The parameter log of this log is open
 bool blackboxParamsActive(void);
 
+// A number that changes when a capture finds a change of the configuration, a loader runs or a log starts. Equal
+// numbers: a deterministic setter that had no effect has no effect again.
+uint32_t blackboxParamsChangeCount(void);
+
 #else
 
 static inline void blackboxParamsBoot(void) { }
@@ -137,5 +141,6 @@ static inline bool blackboxParamsMspBegin(int16_t cmd) { (void)cmd; return false
 static inline void blackboxParamsApplied(bbpLoader_e loader, int slot) { (void)loader; (void)slot; }
 static inline void blackboxParamsMarker(bbpMarker_e marker, uint32_t a, uint32_t b) { (void)marker; (void)a; (void)b; }
 static inline bool blackboxParamsActive(void) { return false; }
+static inline uint32_t blackboxParamsChangeCount(void) { return 0; }
 
 #endif

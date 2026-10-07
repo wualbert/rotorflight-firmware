@@ -102,6 +102,13 @@ typedef struct {
 
 static adjustmentState_t adjustmentState[MAX_ADJUSTMENT_RANGE_COUNT];
 
+// The last set that did not change the value (a setter that clamps it), for the parameter journal
+static struct {
+    int         index;
+    int         value;
+    uint32_t    changes;
+} adjNoEffect = { .index = -1 };
+
 static timeMs_t       adjustmentTime   = 0;
 static const char *   adjustmentName   = NULL;
 static int            adjustmentFunc   = 0;
@@ -354,12 +361,26 @@ void processRcAdjustments(void)
                 adjval = constrain(adjval, adjRange->adjMin, adjRange->adjMax);
 
                 if (adjval != adjState->adjValue) {
-                    blackboxParamsOpBegin(BBP_SRC_ADJUSTMENT, adjFunc);
+                    // The same set as the last one without an effect, and no change of the configuration since:
+                    // the set has no effect again. No journal operation, which would compare the whole
+                    // configuration twice at each RX frame while the knob stays above the limit of the setter.
+                    const bool repeat = (index == adjNoEffect.index && adjval == adjNoEffect.value &&
+                                         blackboxParamsChangeCount() == adjNoEffect.changes);
+                    const int request = adjval;
+
+                    if (!repeat)
+                        blackboxParamsOpBegin(BBP_SRC_ADJUSTMENT, adjFunc);
                     adjConfig->cfgSet(adjval);
-                    blackboxParamsOpEnd();
+                    if (!repeat)
+                        blackboxParamsOpEnd();
                     adjval = adjConfig->cfgGet();
 
-                    if (adjval != adjState->adjValue) {
+                    if (adjval == adjState->adjValue) {
+                        adjNoEffect.index = index;
+                        adjNoEffect.value = request;
+                        adjNoEffect.changes = blackboxParamsChangeCount();
+                    }
+                    else {
                         updateAdjustmentData(adjFunc, adjval);
                         blackboxAdjustmentEvent(adjFunc, adjval);
 

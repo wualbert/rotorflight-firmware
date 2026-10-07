@@ -116,6 +116,9 @@ static const bbpPoint_t pointPre = { BBP_PRE, 0 };
 bbpPg_t bbpPg[BBP_TRACKED];
 uint32_t bbpPgAllInHeader;
 
+// Changes of the configuration that the journal saw, and loads: blackboxParamsChangeCount()
+static uint32_t bbpChanges;
+
 // One header line or one journal event
 static char bbpLine[(BBP_LINE_MAX > BBP_EVENT_MAX) ? BBP_LINE_MAX : BBP_EVENT_MAX + 1];
 
@@ -1031,6 +1034,7 @@ static bool stepGroup(int t, bbpPoint_t at, int32_t *budget)
             groupEqual(t, at, step.compared);
             return true;
         }
+        bbpChanges++;
         walkBegin(&step.walk, t, 0);
         if (*budget <= 0) {
             return false;
@@ -1107,6 +1111,7 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
             }
             continue;
         }
+        bbpChanges++;
 
         const bool own = !attributed || ((bbp.lostMask | bbp.prevMask) & BIT(t));
         if (own) {
@@ -1226,6 +1231,7 @@ static uint32_t runtimeValue(int i)
 
 void blackboxParamsApplied(bbpLoader_e loader, int slot)
 {
+    bbpChanges++;
     if (!bbp.active) {
         return;
     }
@@ -1682,6 +1688,7 @@ void blackboxParamsStart(void)
     const uint8_t mode = blackboxConfig()->params;
 
     clearJournal();
+    bbpChanges++;
     bbp.active = (mode != BLACKBOX_PARAMS_OFF);
     bbp.lineLength = 0;
     bbp.linePos = 0;
@@ -1830,6 +1837,11 @@ void blackboxParamsStop(void)
 uint32_t blackboxParamsSeq(void)
 {
     return bbp.seq;
+}
+
+uint32_t blackboxParamsChangeCount(void)
+{
+    return bbpChanges;
 }
 
 #endif
