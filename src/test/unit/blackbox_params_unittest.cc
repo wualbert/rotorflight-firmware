@@ -1607,6 +1607,58 @@ TEST(BlackboxParamsJournalTest, RingOverflowGivesLostThenResync)
         countRecords(j, 'C', "y"), lost->fields.at("pgs").c_str(), q->fields.at("lostrec").c_str());
 }
 
+// A resync that does not fit in the ring: 'y' records with part=1 keep the 'L' loss of the group open. When a 'y'
+// record without part=1 ends the loss, every byte of the group is known again (spec 2.6.5).
+TEST(BlackboxParamsJournalTest, PartialResyncKeepsTheLossOpen)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    Decoded d = decodeHeader(runHeader());
+    runningLog();
+    sim.iteration = 50;
+    sim.freeSpace = 0;
+    blackboxParamsOpBegin(BBP_SRC_MSP, 1);
+    for (int k = 0; k < PID_PROFILE_COUNT; k++) {
+        uint8_t *p = (uint8_t *)pidProfilesMutable(k);
+        for (unsigned i = 16; i < sizeof(pidProfile_t); i++) {
+            p[i] ^= 1;
+        }
+    }
+    blackboxParamsOpEnd();
+    sim.freeSpace = 100000;
+    drainJournal();
+
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    const int t = bbpTrackedIndex(PG_PID_PROFILE);
+    const std::string pgs = std::to_string(PG_PID_PROFILE);
+    int parts = 0, ends = 0;
+    for (const JRecord &r : j.records) {
+        Journal one;
+        one.records.push_back(r);
+        std::vector<std::string> errors;
+        applyJournal(d, one, errors);
+        for (const std::string &e : errors) {
+            ADD_FAILURE() << e;
+        }
+        if (r.type != 'C' || r.fields.at("s") != "y" || r.fields.at("pgs") != pgs) {
+            continue;
+        }
+        if (r.fields.count("part")) {
+            EXPECT_EQ("1", r.fields.at("part"));
+            EXPECT_GT(r.items.size(), 0u) << "a part without items";
+            parts++;
+            continue;
+        }
+        // The end of the loss: the state of the reader is the live state
+        ends++;
+        EXPECT_EQ(0, memcmp(d.bytes[t].data(), trackedReg(t)->address, pgSize(trackedReg(t)))) << "y record " << r.seq;
+    }
+    EXPECT_GE(parts, 1);
+    EXPECT_EQ(1, ends);
+    expectStateIsLive(d);
+    printf("partial resync: %d records, %d y parts\n", (int)j.records.size(), parts);
+}
+
 // A change and its revert are both lost while the ring is full: the resync is a 'y' record without items, with an
 // interval from the last verified point of the group (spec 2.4)
 TEST(BlackboxParamsJournalTest, ItemlessResyncHasAnInterval)

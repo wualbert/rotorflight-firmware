@@ -28,7 +28,7 @@
  *   at      "p" (before T0), <iteration>.<tick>, or <iteration>.<tick>~<iteration>.<tick> (an interval)
  *   crc     CRC-8 (polynomial 0xD5, initial value 0) of the chars before '*', two uppercase hex digits
  *
- *   C   s=<src>[.<arg>] [pgs=<pgn>] n=<items> <key>=<new><<old> ...   ('+' events continue the items)
+ *   C   s=<src>[.<arg>] [pgs=<pgn> [part=1]] n=<items> <key>=<new><<old> ...   ('+' events continue the items)
  *   A   <loader>[/<slot>] [fp=<hex>]
  *   R   gov_mode=<n> features=<hex> fp.pid=<hex> fp.gov=<hex> fp.sp=<hex>   (any subset)
  *   M   eesave us=<n> | eeload | escparam n=<len> fnv=<hex> | shadow-reset
@@ -37,7 +37,8 @@
  *
  * Records of source u (no hook saw the write), v (a change between logs) and y (a resync after a ring
  * overflow) have their own record for each group, with an interval from the last point where the group was
- * proved equal to the shadow. A y record gives "pgs=<pgn>", also when it has no items.
+ * proved equal to the shadow. A y record gives "pgs=<pgn>", also when it has no items. A y record that does not
+ * complete its group has "part=1": the 'L' loss of the group goes on until a y record without it.
  *
  * The task that changes the configuration captures the change: a word compare of the groups with the shadow
  * (the PG copies) and a walk of the changed words. The records wait in a RAM ring. The PID task writes at most
@@ -87,6 +88,7 @@
 #define BBP_HOLD_MS         100     // longest delay of LOG_END while records wait
 #define BBP_RESYNC_FREE     256     // ring bytes free before a resync after an overflow
 #define BBP_DIFF_WORDS      8       // changed-word bitmap: a group of at most 1024 B
+#define BBP_ARG_PART        0x8000  // ring arg of a 'y' record (the pgn): the record does not complete the group
 
 STATIC_ASSERT((BBP_RING_SIZE & (BBP_RING_SIZE - 1)) == 0, bbp_ring_size_power_of_2);
 
@@ -178,7 +180,7 @@ static struct {
 // The record that a capture builds
 static struct {
     bool        open;
-    bool        partial;            // items did not fit
+    bool        partial;            // the record does not complete its group (items did not fit)
     uint8_t     type;
     char        src;
     uint16_t    arg;
@@ -588,8 +590,9 @@ static void recCommit(void)
     }
     rec.open = false;
 
-    if (rec.type == 'C' && rec.count == 0 && rec.src != 'y') {
-        // Nothing to record. The items that did not fit are in the lost groups.
+    if (rec.type == 'C' && rec.count == 0 && (rec.src != 'y' || rec.partial)) {
+        // Nothing to record. The items that did not fit are in the lost groups. A 'y' record without items tells
+        // that the group is back at its recorded values, but only when it completes the group.
         if (rec.seq == bbp.seq) {
             bbp.seq--;
         }
@@ -599,7 +602,7 @@ static void recCommit(void)
     const uint16_t h = rec.start;
     ringPutN(h + REC_TYPE, 1, rec.type);
     ringPutN(h + REC_SRC, 1, rec.src);
-    ringPutN(h + REC_ARG, 2, rec.arg);
+    ringPutN(h + REC_ARG, 2, (rec.src == 'y' && rec.partial) ? rec.arg | BBP_ARG_PART : rec.arg);
     ringPutN(h + REC_SEQ, 4, rec.seq);
     ringPutN(h + REC_N0, 4, rec.from.n);
     ringPutN(h + REC_C0, 1, rec.from.c);
@@ -888,7 +891,8 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
 
 lost:
     // Items that fit stay valid. The shadow of the other differences stays unsynced: the PID task writes 'L',
-    // then a 'y' record for each group.
+    // then a 'y' record for each group. A 'y' record of a group that is lost already gets "part=1", so its 'L'
+    // stays open.
     recCommit();
     if (!(bbp.lostMask & ~bbp.lostListed)) {
         bbp.lostAt = at;
@@ -1134,7 +1138,10 @@ static void formatEvent(void)
             bbpPutChar(&w, src);
             if (src == 'y') {
                 bbpPutStr(&w, " pgs=");
-                bbpPutUint(&w, arg);
+                bbpPutUint(&w, arg & ~BBP_ARG_PART);
+                if (arg & BBP_ARG_PART) {
+                    bbpPutStr(&w, " part=1");
+                }
             } else if (arg != BBP_ARG_NONE) {
                 bbpPutChar(&w, '.');
                 bbpPutUint(&w, arg);
