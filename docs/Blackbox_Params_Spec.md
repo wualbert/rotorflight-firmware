@@ -96,7 +96,7 @@ Appendix A has the full ledger with `file:line` evidence. In short:
 | A deferred compare gives unhooked changes a wrong exact stamp (minimal, PJ) | The pre-capture at the start of every operation. |
 | No per-frame carrier, no CRC, no end record (minimal) | S-frame `paramSeq`, a CRC-8 for each event, and the `Q` record. |
 | The PID task diffs 200-265 µs per drain. The `LOG_END` drain is unbounded. A 4.8 KB nano `memcpy` (minimal) | The capture runs in the task that makes the change, with a word diff. At most one event is written per logged iteration. The hold is at most 100 ms. No bulk copy at log start. |
-| 38 KB of snapshot streamed after T0. A 128 B reserve. A compare on every MSP command. No runtime OFF (PJ) | The snapshot is written before T0. The reserve is 192 B. Read and skip-list commands do no work. The runtime OFF exists. |
+| 38 KB of snapshot streamed after T0. A 128 B reserve. A compare on every MSP command. No runtime OFF (PJ) | The snapshot is written before T0. The reserve is 256 B. Only allowlisted tracked-write commands start operations. The runtime OFF exists. |
 | B, P and R at T0 are dropped by the state gate (PJ) | Nothing is written before RUNNING. The T0 hook runs after the state assignment (`blackbox.c:2152-2153`). |
 | An adjustment refresh can name only one field (PJ) | The viewer table lists a set of runtime fields for each adjustment (`governor.c:1359-1377`). |
 | Records up to 255 chars (minimal) | At most 128 chars. |
@@ -453,7 +453,7 @@ No line changes a flight computation. PR-C (3.11) is the separate, optional set 
 #define BBP_TRACKED        30
 #define BBP_RING_SIZE      1024   // binary records
 #define BBP_EVENT_MAX      128    // chars in one event 101 (decoder limit 252)
-#define BBP_FRAME_RESERVE  192    // device bytes left free for frames after an event (about 4 frames of 41-48 B)
+#define BBP_FRAME_RESERVE  256    // device bytes left free for frames after an event
 #define BBP_SCAN_BYTES     128    // compared per logged iteration
 #define BBP_HOLD_MS        100    // longest LOG_END delay
 #define BBP_PRE            0xFFFFFFFFu
@@ -645,9 +645,9 @@ static void scanStep(bbpPoint_t now)
 }
 ```
 
-- **Captures in steps.** The PID task never captures a whole PG in one call. The resync (`y`), a difference that the scan finds (`u`) and the compare with the previous log in the header states (`v`, 3.8) are captures in steps with a limit of work (`BBP_STEP_UNITS`, 128 units of about 10 cycles: a compare of 32 B is 11, a valueTable entry 8, an item 12, a formatted element 100). One step compares the next blocks of the PG into the changed-word bitmap, or walks the next entries, elements or raw bytes and makes their items. Each step with items is a record of its own, with the interval from `bbpVerified[t]` to the point of that step. A `y` record that does not complete the PG has `part=1` (2.4). When the walk is done, `bbpVerified[t]` becomes the point of the first compare step, as for the scan. Any other capture of the PG (an operation, a loader) stops the steps: its own record has the differences that are left.
+- **Captures in steps.** The PID task never captures a whole PG in one call. The resync (`y`), a difference that the scan finds (`u`) and the compare with the previous log in the header states (`v`, 3.8) are captures in steps with a limit of work (`BBP_STEP_UNITS`, 128 abstract units: a compare of 32 B is 11, a valueTable entry 8, an item 12, a formatted element 100). One step compares the next blocks of the PG into the changed-word bitmap, or walks the next entries, elements or raw bytes and makes their items. Each step with items is a record of its own, with the interval from `bbpVerified[t]` to the point of that step. A `y` record that does not complete the PG has `part=1` (2.4). When the walk is done, `bbpVerified[t]` becomes the point of the first compare step, as for the scan. Any other capture of the PG (an operation, a loader) stops the steps: its own record has the differences that are left.
 - `blackboxDeviceFreeSpace()` is moved out of `blackboxReplenishHeaderBudget` (`blackbox_io.c:665-687`) with no change of behaviour.
-- **Bytes per iteration.** At most one event, up to 131 B, is written per logged iteration, and only when 192 B stay free for frames afterwards. So the journal can never cause a flashfs drop. On G4 it adds at most 131 B to a flush.
+- **Bytes per iteration.** At most one event, up to 131 B, is written per logged iteration, and only when 256 B stay free for frames afterwards. This bounds the journal contribution to one flush; it does not prove that the device keeps up. The hardware drop-counter gate remains required.
 - **Fingerprints.** They are FNV-1 over 32-bit words of the parameter fields only, never loop state:
   - `fp.pid`: what `pidLoadProfile` writes (`pid.c:583-717`).
   - `fp.gov`: what `governorInitProfile` writes (`governor.c:1543-1601`) plus `gov.idleThrottle` and `gov.autoThrottle`, but not `requestedHeadSpeed`.
@@ -655,39 +655,28 @@ static void scanStep(bbpPoint_t now)
 
 ### 3.8 Header writer and between-log records
 
-```c
-void blackboxParamsStart(void)          // blackboxStart() (blackbox.c:1169-1210)
-{
-    bbp.active = (blackboxConfig()->params != BLACKBOX_PARAMS_OFF);
-    if (!bbp.active) return;
-    clear ring, seq = 0, opDepth = 0, t0 = false, lostMask = 0, header cursor = 0, bbpVerified[] = PRE;
-    if (!bbp.shadowValid) { copy live -> shadow (word loop, 2.7 KB, about 8 us); recMarker(PRE, "shadow-reset"); bbp.shadowValid = true; bbp.prevMask = 0; }
-    else bbp.prevMask = ALL_TRACKED;    // compared in steps in the header iterations: 'v' records, stamp p
-}
-void blackboxParamsHeaderTick(void)     // each blackboxUpdate() while the state is WAIT_FOR_READY .. CACHE_FLUSH
-{
-    if (bbp.active && bbp.prevMask) stepGroups(bbp.prevMask, PRE, 0);    // one step of work (3.7)
-}
-bool blackboxParamsWriteHeader(void)    // custom case of blackboxWriteSysinfo(); true when param_end is written
-{
-    if (!bbp.lineReady) { if (!nextHeaderLine(bbpLine)) return !bbp.prevMask; bbp.lineReady = true; }   // T0 waits for the 'v' compare
-    const int len = strlen(bbpLine);
-    if (blackboxDeviceReserveBufferSpace(len) != BLACKBOX_RESERVE_SUCCESS) return false;   // budget 64 B per iteration, cap 256
-    blackboxWriteString(bbpLine); blackboxHeaderBudget -= len;
-    bbp.hdrHash = fnv_update(bbp.hdrHash, bbpLine, len); bbp.hdrLines++; bbp.lineReady = false;
-    return false;                       // at most one line per call
-}
-void blackboxParamsRunning(void)        // the state became RUNNING after CACHE_FLUSH
-{
-    if (!bbp.active) return;
-    if (bbp.prevMask) bbpCapture(false, 'v', 0, PRE, bbp.prevMask, -1);    // normally nothing is left
-    recRuntimeAll(PRE);                 // one 'R' with all five values: the base for the polls
-    bbp.t0 = true;
-}
-```
+`blackboxParamsStart()` activates CHANGES or FULL, clears the per-log state and starts the header formatter.
+If the shadow is valid, the header ticks compare it with live configuration in bounded steps and record between-log
+changes with source `v` and a pre-frame stamp. If an earlier log lost records or the CLI borrowed the shadow,
+the start path copies the tracked groups into the shadow and emits `M shadow-reset`; it does not claim an exact
+between-log history for that interval. The exceptional copy remains part of the hardware start-path measurement.
 
-- The stages of `nextHeaderLine` are META, then SET, SET@P, SET@R, ELEMENTS, RAW and BOOT for FULL, then END.
-- One header line costs at most about 30 µs of formatting. A profile line with 6 values is the largest.
+`blackboxParamsHeaderTick()` performs one 128-unit capture step while previous-state groups remain. It then verifies
+idle-loader regions in the captured shadow, charging at most 128 bytes or metadata units per tick. A revision counter
+invalidates verification if configuration changes again.
+
+`blackboxParamsWriteHeader()` writes at most 64 bytes and formats at most four new lines per call. It retains a
+partially written line for the next call. A formatter result of zero means its work budget was exhausted and causes
+an immediate return; the same call must not restart that scan. Raw-byte coverage comes from a precomputed bitmap.
+The formatter stages are META, then SET, SET@P, SET@R, ELEMENTS, RAW and BOOT for FULL, then END.
+Completion also waits for the previous-state capture and idle-loader verification.
+
+`blackboxParamsRunning()` emits inferred pre-frame apply records only for verified, unchanged loader regions,
+then initializes the runtime record and bounded scan. It performs no region hash sweep. A write during CACHE_FLUSH
+withholds inferred apply records rather than attributing a stale application to the final header state.
+
+The complete call, including formatting and output, must meet the hardware limits in section 3.12. No host timing
+estimate establishes the MCU maximum.
 
 ### 3.9 Lifecycle edits in `blackbox.c` and the core
 
@@ -697,7 +686,7 @@ void blackboxParamsRunning(void)        // the state became RUNNING after CACHE_
 | `:2129` | the field count is `blackboxSlowFieldCount()` (5 or 9) |
 | `:1169-1210` `blackboxStart` | `blackboxParamsStart();` before `blackboxSetState(WAIT_FOR_READY)` |
 | `:683-711` `blackboxSetState` | cases SHUTTING_DOWN, FULL and START_ERASE: `blackboxParamsStop();` (inactive, ring cleared). Each state that ends a log stops the journal, also when it ends without `LOG_END`. |
-| `:1243-1244` | `if (blackboxParamsHoldLogEnd()) break; blackboxParamsEnd();` before `LOG_END`. GRACE goes on logging frames during the hold. PAUSED goes on draining. |
+| `:1243-1244` | `if (blackboxParamsHoldLogEnd()) break; blackboxParamsEnd();` before `LOG_END`. GRACE goes on logging frames during the hold. PAUSED SWITCH termination skips the hold and closes immediately. |
 | `:1779` (after `fields_mask`) | `BLACKBOX_PRINT_HEADER_CUSTOM( if (!blackboxParamsWriteHeader()) xmitState.headerIndex--; );` |
 | `:1986-1999` `blackboxLogIteration` | `blackboxParamsAfterFrame();` after `writeIntraframe()` / `writeInterframe()` |
 | `:2041` `blackboxUpdate` | after `blackboxCheckEnabler`: `if (state >= WAIT_FOR_READY && state <= CACHE_FLUSH) blackboxParamsHeaderTick();` |
@@ -719,9 +708,9 @@ void blackboxParamsRunning(void)        // the state became RUNNING after CACHE_
 
 | Path | Site | Call |
 |---|---|---|
-| All MSP (serial, telemetry, nested) | `msp/msp.c:4074-4102` | Wrap the chain from `:4087` to `:4099` (out-with-arg, passthrough, dataflash read, in-commands) in `bbpOpBegin('m', cmd)` / `bbpOpEnd()`. The two read-only branches (`:4083-4086`) and a skip list do no work. The skip list is SET_RAW_RC, DATAFLASH_READ, SET_PASSTHROUGH, SET_RTC, SET_TX_INFO, SET_RAW_GPS, SET_HEADING, SET_MOTOR, SET_MOTOR_OVERRIDE, SET_SERVO_OVERRIDE(_ALL), SET_MIXER_OVERRIDE, SEND_DSHOT_COMMAND, MULTIPLE_MSP and REBOOT. The bracket includes `MSP_SET_SERVO_CONFIG` (`:2224-2249`) and runs whatever the result is. |
+| All MSP (serial, telemetry, nested) | `msp/msp.c:4074-4102` | Wrap the chain from `:4087` to `:4099` (out-with-arg, passthrough, dataflash read, in-commands) in `bbpOpBegin('m', cmd)` / `bbpOpEnd()`. Read requests and unknown commands do no journal work. Only the tracked-write allowlist opens an operation.  The bracket includes `MSP_SET_SERVO_CONFIG` (`:2224-2249`) and runs whatever the result is. |
 | ESC parameters | `msp.c:3100-3111` after `escCommitParameters()` | `bbpMarker(ESCPARAM, len, fnv)`. The ESC bytes are outside the FC configuration. |
-| Adjustments | `fc/rc_adjustments.c:356` | `bbpOpBegin('a', adjFunc); adjConfig->cfgSet(adjval); bbpOpEnd();`. This also catches a set whose read-back equals the stale value, which logs no event today. A set that had no effect (a setter that clamps the value) repeats at each RX frame while the knob stays there. The same set (slot and value) again, with no change of `blackboxParamsChangeCount()` since, has no effect again, so it runs without the operation. The count changes with each change that a capture finds, each loader and each log start. `cfgSet` is called as in 4.6.0. |
+| Adjustments | `fc/rc_adjustments.c:356` | `bbpOpBegin('a', adjFunc); adjConfig->cfgSet(adjval); bbpOpEnd();`. This also catches a set whose read-back equals the stale value, which logs no event today. A set that had no effect (a setter that clamps the value) repeats at each RX frame while the knob stays there. The same set (range and value) again, with no change of `blackboxParamsChangeCount()` since, has no effect again, so it runs without the operation. The count changes with each change that a capture finds, each loader and each log start. Each range has its own cache, invalidated when the range resets. `cfgSet` is called as in 4.6.0. |
 | CMS | `cms/cms.c:1021` `cmsHandleKey` (callers `:1354`, `:1373`) | Rename it to `cmsHandleKeyInner`. The wrapper brackets it with `'k'`. CMS opens only while disarmed (`:1466-1468`) and stops arming (`:891`). The log can still be open in GRACE. |
 | PID profile switch (sticks, CMS, MSP, adjustment) | `config/config.c:839-851` `changePidProfile` | self-bracketing `'p'` (nested inside MSP, adjustment and CMS operations) |
 | Rate profile switch | `fc/rc_rates.c:435-442` | self-bracketing `'p'`, `arg = 0x100 \| index` |
@@ -756,6 +745,11 @@ The CLI stops the blackbox (`core.c:830`). The audit in 6.2 lists the remaining 
 
 The scan catches anything that the audit missed, as a `u` record with an interval.
 
+MSP tracked-write allowlist: `MSP_SELECT_SETTING, MSP_COPY_PROFILE, MSP_SET_ACC_TRIM, MSP_SET_DEBUG_CONFIG, MSP_SET_ARMING_CONFIG, MSP_SET_PID_TUNING, MSP_SET_RC_TUNING, MSP_SET_MOTOR_CONFIG, MSP_SET_SERVO_CONFIGURATION, MSP_SET_SERVO_CENTER, MSP_SET_RESET_CURR_PID, MSP_SET_SENSOR_ALIGNMENT, MSP_SET_ADVANCED_CONFIG, MSP_SET_FILTER_CONFIG, MSP_SET_RPM_FILTER_V2, MSP_SET_PID_PROFILE, MSP_SET_RESCUE_PROFILE, MSP_SET_GOVERNOR_PROFILE, MSP_SET_SENSOR_CONFIG, MSP_ACC_CALIBRATION, MSP_SET_ESC_SENSOR_CONFIG, MSP_SET_ESC_PARAMETERS, MSP_EEPROM_WRITE, MSP_SET_BLACKBOX_CONFIG, MSP_SET_FEATURE_CONFIG, MSP_SET_BOARD_ALIGNMENT_CONFIG, MSP_SET_MIXER_CONFIG, MSP_SET_MIXER_INPUT, MSP_SET_MIXER_RULE, MSP_SET_RX_CONFIG, MSP_SET_FAILSAFE_CONFIG, MSP_SET_RXFAIL_CONFIG, MSP_SET_RSSI_CONFIG, MSP_SET_RX_MAP, MSP_SET_RC_CONFIG, MSP_SET_GOVERNOR_CONFIG, MSP_SET_VOLTAGE_METER_CONFIG, MSP_SET_CURRENT_METER_CONFIG, MSP_SET_BATTERY_CONFIG, MSP_SET_BATTERY_PROFILE, MSP_SET_EXPERIMENTAL, MSP_SET_SERVO_CONFIG, MSP_RESET_CONF, MSP2_SET_SMARTFUEL_CONFIG`.
+
+The static audit checks every MSP case with a reachable write to a tracked group against this list.
+Interrupt-context commands do not access journal state. The subsequent scan records their writes with an interval.
+
 ### 3.11 Behaviour fixes (PR-C; separate commits, optional, listed in `param_fixes`)
 
 | Id | Site | Fix |
@@ -771,30 +765,41 @@ The journal does not depend on PR-C. Without PR-C, these cases show as pending i
 
 ### 3.12 Budgets
 
-Times are estimates from instruction counts. The bench test (6.4) measures them.
+Software limits and hardware acceptance limits are distinct. Docker tests verify the work limits and output contract.
+They do not measure STM32 execution time, flash stalls, stack high-water marks or late PID tasks.
 
-| Item | G474 (Fireball, 170 MHz, blocking W25N writes) | F722 (Gaui, 216 MHz) |
-|---|---|---|
-| RAM, static | about 2.8 KB (10,336 B free before, about 7.5 KB after) | about 2.8 KB (DTCM 24,936 B free, SRAM1 89,612 B free) |
-| RAM with `BBP_OWN_SHADOW` | +2,683 B (about 4.8 KB stays free) | +2,699 B |
-| Flash | 9-12 KB (the prototype module measured +5,172 B: FLASH1 442,356 to 447,528 B) of 57,356 B free | 9-12 KB of 38,098 B free |
-| Full compare of 2,679 B (unrolled word loop, 1.5-2 cycles/B) | 16-32 µs | 13-25 µs |
-| One write operation (pre-capture, 1-3 regional loader captures, post-capture, items) in the MSP, RX or CMS task | 45-90 µs, once per human action | 35-70 µs |
-| Idle, per logged iteration (scan of 128 B, plus one poll every 4 iterations) | about 1-2 µs (0.1-0.2 % at 1 kHz) | about 1-1.5 µs (0.2-0.3 % at 2 kHz) |
-| Drain while records wait (format one event of at most 128 chars) | 5-15 µs, 1-30 iterations per change | 4-12 µs |
-| One capture step in the PID task (`v` compare in the header, resync after a loss, `u` after a scan hit; 3.7) | 10 µs or less (128 units) | 8 µs or less |
-| Header line (header states only, at most one per call) | 30 µs or less | 25 µs or less |
-| Extra flash bytes in one flush during a drain | 131 B or less, so 25 µs or less of blocking SPI at about 0.19 µs/B | non-blocking path |
-| Header bytes | FULL about 15 KB, CHANGES about 0.6 KB | same |
-| S-frame | +2-6 B for each S-frame | same |
-| Journal | 30-130 B per change. A profile switch is 2-3 events, about 200 B. | same |
-| Blind window (arm to first I-frame; 4.6.0: 222-229 ms Fireball, 155-163 ms Gaui) | FULL at 64 B/iteration adds about 234 ms. The skipped UART wait saves 100 ms. Net about 360 ms. CHANGES: about 130 ms. | FULL adds about 117 ms, minus 100 ms: net about 180 ms. CHANGES: about 65 ms. |
-| Blind window, serial logger below 1 Mbaud (`blackbox_io.c:327-337`: about 6000 B/s, also 4000-8000 B/s at 4-8 kHz; the UART wait stays) | FULL would add about 2.3 s (13.8 KB at 6000 B/s), so `blackboxParamsStart()` uses CHANGES: about 0.1 s | same |
-| `LOG_END` | delayed by 100 ms or less while records wait | same |
+| Path | Enforced software limit |
+|---|---|
+| Header output | At most 64 bytes and four formatted lines per call; stop immediately on a formatter work-budget yield. |
+| Header raw scan | At most 64 covered bytes/entries per formatter call. Coverage is a precomputed bitmap. |
+| Header previous-state capture | One bounded 128-unit step per header tick. |
+| Idle-loader verification | At most 128 configuration bytes per header tick, with metadata traversal charged to the same budget. T0 does no region hash sweep. A subsequent write invalidates inferred applications. |
+| Running scan | At most 128 configuration bytes per logged iteration. |
+| Drain | At most one event, up to 128 characters, per logged iteration. CRC is accumulated while formatting; storage receives a bulk string write. Keep at least 256 device-buffer bytes free after an event. |
+| Record walks | Bound iteration counts and validate item/payload lengths against the 1024-byte ring. |
+| Tracked PG size | Compile-time assertion at 1024 bytes; larger PGs cannot silently disappear. |
+| LOG_END | At most 100 ms hold in GRACE. SWITCH termination from PAUSED ends without that hold. |
+| OFF | No journal records or idle-loader hashes. |
 
-- **Re-arms in GRACE** have no header and no blind window, as in 4.6.0.
-- **Option.** A compile-time `BBP_HEADER_BYTES_PER_ITERATION 128` for FLASH halves the added header time, but doubles the SPI time per header tick on G4. Enable it only after the bench test.
-- **Upstream concern.** An upstream objection to the FULL blind window is answered by the default CHANGES. The fork default is FULL: on flash and SD the blind window is above, and a serial logger below 1 Mbaud gets CHANGES.
+Hardware acceptance limits remain: a complete operation at most 100 microseconds on G474 or 80 on F722;
+idle journal work at most 3 microseconds per logged iteration; a capture step at most 10/8 microseconds;
+a complete header call at most 30/25 microseconds. Measure the drain and total PID-task maximum separately,
+including storage flushes, and require no new late PID tasks against stock firmware with the same configuration.
+The earlier 5–15 microsecond drain estimate was not a measurement and is not evidence of passing this gate.
+
+Optional `OPTIONS=BLACKBOX_PARAMS_PROFILE` builds expose `bbpProfileCalls` and `bbpProfileMaxCycles` for
+HeaderTick, WriteHeader, Running, AfterFrame, OpBegin, OpEnd and OperationSpan, in that order. They use DWT and include interrupt
+latency. OperationSpan also includes the enclosed writer and loader work. The profile build counts refused flash bytes
+in `bbpFlashfsDroppedBytes` and enables the existing `USE_STACK_CHECK` task. It preserves the log format and configuration. Read the actual `SystemCoreClock`
+when converting cycles to time. The ordinary build contains no profiling counters, wrappers or added stack-check task.
+
+FULL adds approximately 14 KB per log; CHANGES adds approximately 0.6 KB. Measure the arm-to-first-frame
+window on each board. Re-arms within GRACE retain the existing log. Serial logging below 1 Mbaud automatically
+falls back to CHANGES. The fork default remains FULL; CHANGES is the proposed upstream default.
+
+The validation report records actual linker-region usage for both the candidate and the current RF-4.6.x
+baseline. Linker free space is not a stack measurement. Private shadow storage is optional via
+`BLACKBOX_PARAMS_OWN_SHADOW` and is tested separately.
 
 ### 3.13 Upstream split
 
@@ -1105,11 +1110,11 @@ New detectors in `param_epochs.cjs`, each with a `RULES` entry:
 **Measurements.**
 - Arm to first I-frame (blind window), against a stock build. Also with a serial logger at 115200 baud (FULL gives CHANGES) and at 2 Mbaud.
 - `debug_mode = SCHEDULER_DETERMINISM` and `PIDLOOP`: late-task counts and the cycle-time distribution.
-- A test-only drop counter in `flashfsWriteByte` (`io/flashfs.c:576-590`).
-- The operation time, with the cycle counter around `bbpOpBegin` and `bbpOpEnd`.
+- `bbpFlashfsDroppedBytes` in the supplied profile build counts bytes refused by `flashfsWriteByte`. Require zero except in a deliberate full-storage test, recorded separately.
+- The operation span and individual begin/end hook maxima from the supplied DWT counters. Measure EEPROM saves separately from ordinary setting changes.
 - The drain time.
-- The slowest `blackboxParamsHeaderTick()`, `blackboxParamsWriteHeader()` and `blackboxParamsAfterFrame()` call, with the cycle counter, in the worst cases of the unit test `WorstPidTaskCall`: every value of the 6 PID profiles and the 6 rate profiles changed (a) between two logs, (b) by an operation that overflows the ring, (c) by a write that no hook saw. On the host (-O2) the slowest capture step is about 0.2 µs, and the slowest call with a drain of a 128-char event about 1.1 µs. The slowest header line is about 2 µs.
-- The stack high-water mark.
+- The slowest `blackboxParamsHeaderTick()`, `blackboxParamsWriteHeader()` and `blackboxParamsAfterFrame()` call, with the cycle counter, in the worst cases of the unit test `WorstPidTaskCall`: every value of the 6 PID profiles and the 6 rate profiles changed (a) between two logs, (b) by an operation that overflows the ring, (c) by a write that no hook saw. Host times are diagnostic only; measure the complete call on each MCU, including storage work.
+- The stack high-water mark from `status` in the profile build (`USE_STACK_CHECK`), against its linker stack allocation.
 - The `tasks` CPU.
 
 ### 6.5 Viewer tests
@@ -1181,7 +1186,7 @@ New detectors in `param_epochs.cjs`, each with a `RULES` entry:
 | A15 | Records up to 255 chars; the decoder limit is 252 (minimal; compatibility) | `flightlog_parser.js:16`, `:1788` | 128 chars or less |
 | A16 | PID-task diff of 200-265 µs, unbounded `LOG_END` drain, 4.87 KB nano copy (minimal; safety) | `Makefile:300` nano.specs (judge); `blackbox.c:1243-1244` | capture in the changer task with a word diff; one event per iteration; hold of 100 ms or less; no bulk copy |
 | A17 | B, P and R at T0 dropped by the state gate (PJ; exactness, compatibility) | `blackbox.c:683-711` assigns the state at `:712`; the gate is at `:1797-1802` | nothing before RUNNING; T0 hook after `:2152-2153` |
-| A18 | 38 KB streamed after T0; 128 B reserve; compare on every MSP command; no runtime OFF (PJ; safety) | `flash_w25n.c:38-42`; `scheduler.c:665` (serial never deferred) | snapshot before T0; 192 B reserve; no work for reads and the skip list; toggle |
+| A18 | 38 KB streamed after T0; 128 B reserve; compare on every MSP command; no runtime OFF (PJ; safety) | `flash_w25n.c:38-42`; `scheduler.c:665` (serial never deferred) | snapshot before T0; 256 B reserve; tracked-write allowlist; toggle |
 | A19 | "A CLI setting needs a PG layout change" is false (PJ; compatibility) | `pg.c:76-90` | toggle appended (3.9) |
 | A20 | Hook capture about 150-200 µs and `schedulerIgnoreTaskExecTime` in non-realtime tasks (resource-compat; safety) | `scheduler.c:296-308`, `:650-668` | bitmap walk; the call removed |
 | A21 | 2.7 KB copy at `blackboxStart` (resource-compat; safety) | design text | no copy; the PREV stepper does one PG per iteration |

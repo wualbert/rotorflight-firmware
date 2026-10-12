@@ -33,6 +33,8 @@
 #define BBP_LINE_MAX        192     // longest header line, "H " and "\n" included
 #endif
 #define BBP_SCAN_BYTES      128     // parameter bytes compared per logged iteration by the journal scan
+#define BBP_BIT(n)          (UINT32_C(1) << (n)) // changed-word bit 31 must use an unsigned shift
+#define BBP_PG_MAX_BYTES    1024    // capacity of the changed-word bitmap
 
 // Bytes in one "pg.<pgn>+<off>" line: 64, or less when "H boot.pg.4095+4095:" and the hex do not fit in a line
 #define BBP_RAW_MAX         ((BBP_LINE_MAX - 21) / 2 < 64 ? (BBP_LINE_MAX - 21) / 2 : 64)
@@ -69,6 +71,7 @@ typedef struct {
     const pgRegistry_t *reg;        // NULL: the group is not in this build
     uint16_t    vtFirst;            // its valueTable entries are in vtFirst..vtEnd-1 (with entries of other groups
     uint16_t    vtEnd;              // between them if the table is not grouped)
+    uint8_t     *coverage;          // one bit per byte, built once at initialization
 } bbpPg_t;
 
 extern bbpPg_t bbpPg[BBP_TRACKED];
@@ -127,6 +130,8 @@ typedef struct {
     char       *ptr;
     char       *end;
     bool        overflow;
+    uint8_t     crc;
+    bool        crcEnabled;
 } bbpWriter_t;
 
 void bbpPutChar(bbpWriter_t *w, char c);
@@ -156,6 +161,8 @@ static inline bool bbpEntryInHeader(int t, const clivalue_t *v)
 
 // Byte of group t that a set or element line gives
 bool bbpByteCovered(int t, unsigned offset);
+void bbpCoverageInit(void);
+extern uint8_t bbpCoverage[];
 
 /* Journal */
 

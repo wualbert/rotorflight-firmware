@@ -102,12 +102,12 @@ typedef struct {
 
 static adjustmentState_t adjustmentState[MAX_ADJUSTMENT_RANGE_COUNT];
 
-// The last set that did not change the value (a setter that clamps it), for the parameter journal
+// Cache each range independently when its setter clamps a request without changing the value.
 static struct {
-    int         index;
+    bool        valid;
     int         value;
     uint32_t    changes;
-} adjNoEffect = { .index = -1 };
+} adjNoEffect[MAX_ADJUSTMENT_RANGE_COUNT];
 
 static timeMs_t       adjustmentTime   = 0;
 static const char *   adjustmentName   = NULL;
@@ -364,8 +364,8 @@ void processRcAdjustments(void)
                     // The same set as the last one without an effect, and no change of the configuration since:
                     // the set has no effect again. No journal operation, which would compare the whole
                     // configuration twice at each RX frame while the knob stays above the limit of the setter.
-                    const bool repeat = (index == adjNoEffect.index && adjval == adjNoEffect.value &&
-                                         blackboxParamsChangeCount() == adjNoEffect.changes);
+                    const bool repeat = (adjNoEffect[index].valid && adjval == adjNoEffect[index].value &&
+                                         blackboxParamsChangeCount() == adjNoEffect[index].changes);
                     const int request = adjval;
 
                     if (!repeat)
@@ -376,9 +376,9 @@ void processRcAdjustments(void)
                     adjval = adjConfig->cfgGet();
 
                     if (adjval == adjState->adjValue) {
-                        adjNoEffect.index = index;
-                        adjNoEffect.value = request;
-                        adjNoEffect.changes = blackboxParamsChangeCount();
+                        adjNoEffect[index].valid = true;
+                        adjNoEffect[index].value = request;
+                        adjNoEffect[index].changes = blackboxParamsChangeCount();
                     }
                     else {
                         updateAdjustmentData(adjFunc, adjval);
@@ -430,6 +430,7 @@ INIT_CODE void adjustmentRangeInit(void)
 
 INIT_CODE void adjustmentRangeReset(int index)
 {
+    adjNoEffect[index].valid = false;
     adjustmentState[index].adjValue = 0;
     adjustmentState[index].deadTime = 0;
     adjustmentState[index].trigTime = 0;

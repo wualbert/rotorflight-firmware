@@ -42,7 +42,7 @@
  *
  * The task that changes the configuration captures the change: a word compare of the groups with the shadow
  * (the PG copies) and a walk of the changed words. The records wait in a RAM ring. The PID task writes at most
- * one event after each logged frame, and only when 192 B stay free in the device buffer for frames.
+ * one event after each logged frame, and only when 256 B stay free in the device buffer for frames.
  */
 
 #include <stdbool.h>
@@ -71,6 +71,7 @@
 
 #include "msp/msp_protocol.h"
 #include "msp/msp_protocol_v2_betaflight.h"
+#include "msp/msp_protocol_v2_rotorflight.h"
 
 #include "pg/blackbox.h"
 #include "pg/pg.h"
@@ -82,13 +83,34 @@
 #include "blackbox/blackbox_params.h"
 #include "blackbox/blackbox_params_impl.h"
 
+// Optional bench instrumentation. Read these counters with a debugger; no log fields or controller state change.
+// Index: HeaderTick, WriteHeader, Running, AfterFrame, OpBegin, OpEnd, outer operation span.
+// Counts and maxima include interrupt latency; the operation span also includes the configuration writer/loaders.
+#if defined(BLACKBOX_PARAMS_PROFILE) && !defined(UNIT_TEST) && !defined(SIMULATOR_BUILD)
+#define BBP_PROFILE_ENABLED
+volatile uint32_t bbpProfileCalls[7], bbpProfileMaxCycles[7];
+static uint32_t bbpProfileOpStart;
+#define blackboxParamsHeaderTick bbpInnerHeaderTick
+#define blackboxParamsWriteHeader bbpInnerWriteHeader
+#define blackboxParamsRunning bbpInnerRunning
+#define blackboxParamsAfterFrame bbpInnerAfterFrame
+#define blackboxParamsOpBegin bbpInnerOpBegin
+#define blackboxParamsOpEnd bbpInnerOpEnd
+static void bbpProfileRecord(unsigned i, uint32_t start)
+{
+    const uint32_t elapsed = DWT->CYCCNT - start;
+    bbpProfileCalls[i]++;
+    if (elapsed > bbpProfileMaxCycles[i]) bbpProfileMaxCycles[i] = elapsed;
+}
+#endif
+
 #define BBP_RING_SIZE       1024    // binary records, a power of 2
 #define BBP_RING_KEEP       32      // ring bytes kept free for an 'L' record
 #define BBP_REC_HEADER      22
-#define BBP_FRAME_RESERVE   192     // device bytes left free for frames after an event (about 4 frames)
+#define BBP_FRAME_RESERVE   256     // device bytes left free for frames after an event (about 4 frames)
 #define BBP_HOLD_MS         100     // longest delay of LOG_END while records wait
 #define BBP_RESYNC_FREE     256     // ring bytes free before a resync after an overflow
-#define BBP_DIFF_WORDS      8       // changed-word bitmap: a group of at most 1024 B
+#define BBP_DIFF_WORDS      (BBP_PG_MAX_BYTES / 128)
 #define BBP_ARG_PART        0x8000  // ring arg of a 'y' record (the pgn): the record does not complete the group
 #define BBP_STEP_UNITS      128     // work of one capture step in the PID task (units of about 10 cycles, spec 3.7)
 
@@ -119,6 +141,9 @@ uint32_t bbpPgAllInHeader;
 
 // Changes of the configuration that the journal saw, and loads: blackboxParamsChangeCount()
 static uint32_t bbpChanges;
+#ifdef UNIT_TEST
+unsigned bbpTestHashBytes;
+#endif
 
 // One header line or one journal event
 static char bbpLine[(BBP_LINE_MAX > BBP_EVENT_MAX) ? BBP_LINE_MAX : BBP_EVENT_MAX + 1];
@@ -251,6 +276,10 @@ static bool aligned(const void *p)
 
 void blackboxParamsInit(void)
 {
+#ifdef BBP_PROFILE_ENABLED
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+#endif
     bbp.allMask = 0;
     bbp.wordMask = 0;
     for (int t = 0; t < BBP_TRACKED; t++) {
@@ -260,9 +289,9 @@ void blackboxParamsInit(void)
         bbpPg[t].vtFirst = 0;
         bbpPg[t].vtEnd = 0;
         if (bbpPg[t].reg) {
-            bbp.allMask |= BIT(t);
+            bbp.allMask |= BBP_BIT(t);
             if (aligned(reg->address) && aligned(bbpShadow(t))) {
-                bbp.wordMask |= BIT(t);
+                bbp.wordMask |= BBP_BIT(t);
             }
         }
     }
@@ -281,11 +310,11 @@ void blackboxParamsInit(void)
             }
             bbpPg[t].vtEnd = i + 1;
             if (!bbpValueInHeader(&valueTable[i])) {
-                tooLong |= BIT(t);
+                tooLong |= BBP_BIT(t);
             }
             const int section = valueTable[i].type & VALUE_SECTION_MASK;
             if (section != PROFILE_VALUE && section != PROFILE_RATE_VALUE) {
-                master |= BIT(t);
+                master |= BBP_BIT(t);
             }
         }
     }
@@ -293,6 +322,7 @@ void blackboxParamsInit(void)
     bbp.profileOnlyMask = ~master;
 
     bbpTablesInit();
+    bbpCoverageInit();
 }
 
 /* Word loops: newlib-nano memcpy and memcmp work one byte per loop */
@@ -303,7 +333,7 @@ static void copyToShadow(int t)
     const unsigned size = pgSize(reg);
     unsigned i = 0;
 
-    if (bbp.wordMask & BIT(t)) {
+    if (bbp.wordMask & BBP_BIT(t)) {
         const uint32_t *src = (const uint32_t *)reg->address;
         uint32_t *dst = (uint32_t *)bbpShadow(t);
         for (; i < size / 4; i++) {
@@ -341,7 +371,7 @@ static bool groupDiffers(int t, unsigned start, unsigned end)
     const uint8_t *shadow = bbpShadow(t);
     unsigned i = start;
 
-    if (bbp.wordMask & BIT(t)) {
+    if (bbp.wordMask & BBP_BIT(t)) {
         const uint32_t *a = (const uint32_t *)live;
         const uint32_t *b = (const uint32_t *)shadow;
         const unsigned wEnd = end / 4;
@@ -372,7 +402,7 @@ static bool diffRange(int t, unsigned start, unsigned end, uint32_t *map)
     uint32_t any = 0;
 
     unsigned w = start / 4;
-    if (bbp.wordMask & BIT(t)) {
+    if (bbp.wordMask & BBP_BIT(t)) {
         const uint32_t *a = (const uint32_t *)live;
         const uint32_t *b = (const uint32_t *)shadow;
         const unsigned wEnd = end / 4;
@@ -383,7 +413,7 @@ static bool diffRange(int t, unsigned start, unsigned end, uint32_t *map)
             }
             for (unsigned k = w; k < w + 8; k++) {
                 if (a[k] != b[k]) {
-                    map[k / 32] |= BIT(k % 32);
+                    map[k / 32] |= BBP_BIT(k % 32);
                 }
             }
             any = 1;
@@ -391,14 +421,14 @@ static bool diffRange(int t, unsigned start, unsigned end, uint32_t *map)
         }
         for (; w < wEnd; w++) {
             if (a[w] != b[w]) {
-                map[w / 32] |= BIT(w % 32);
+                map[w / 32] |= BBP_BIT(w % 32);
                 any = 1;
             }
         }
     }
     for (unsigned i = w * 4; i < end; i++) {
         if (live[i] != shadow[i]) {
-            map[i / 128] |= BIT((i / 4) % 32);
+            map[i / 128] |= BBP_BIT((i / 4) % 32);
             any = 1;
         }
     }
@@ -742,7 +772,7 @@ static bool walkNamed(int t, const uint32_t *map, unsigned start, unsigned end, 
         const unsigned k = w->k;
         const unsigned base = k * elementSize;
         const bool profileChanged = base < end && base + elementSize > start && mapHas(map, base, elementSize);
-        if (!profileChanged && (k > 0 || (bbp.profileOnlyMask & BIT(t)))) {
+        if (!profileChanged && (k > 0 || (bbp.profileOnlyMask & BBP_BIT(t)))) {
             continue;
         }
         for (; w->i < bbpPg[t].vtEnd; w->i++) {
@@ -772,7 +802,7 @@ static bool walkNamed(int t, const uint32_t *map, unsigned start, unsigned end, 
             }
             const uint8_t slot = perProfile ? k : BBP_SLOT_NONE;
             if (mode == MODE_BITSET) {
-                const uint32_t bit = BIT(v->config.bitpos);
+                const uint32_t bit = BBP_BIT(v->config.bitpos);
                 const uint32_t liveWord = readBytes(live + offset, size);
                 const uint32_t shadowWord = readBytes(shadow + offset, size);
                 if ((liveWord ^ shadowWord) & bit) {
@@ -808,7 +838,7 @@ static bool walkNamed(int t, const uint32_t *map, unsigned start, unsigned end, 
 static bool elementItemFits(uint16_t code, const uint8_t *newBytes, const uint8_t *oldBytes, unsigned size)
 {
     char text[BBP_ITEM_MAX];
-    bbpWriter_t w = { text, text + sizeof(text), false };
+    bbpWriter_t w = { text, text + sizeof(text), false, 0, false };
 
     return size <= BBP_ITEM_BYTES_MAX && bbpPutItem(&w, code, BBP_SLOT_NONE, BBP_SLOT_NONE, newBytes, oldBytes, size);
 }
@@ -948,7 +978,7 @@ static bool walkGroup(int t, const uint32_t *map, unsigned start, unsigned end, 
 // The whole group was equal to the shadow at 'verified', and is at 'at'
 static void groupEqual(int t, bbpPoint_t at, bbpPoint_t verified)
 {
-    if (bbp.lostMask & BIT(t)) {
+    if (bbp.lostMask & BBP_BIT(t)) {
         // The lost bytes are back at their recorded values: a 'y' record without items. Its interval starts at the
         // last verified point, before this one.
         if (rec.open) {
@@ -956,21 +986,21 @@ static void groupEqual(int t, bbpPoint_t at, bbpPoint_t verified)
         }
         if (recBegin('C', 'y', pgN(bbpPg[t].reg), intervalStart(t, at), at)) {
             recCommit();
-            bbp.lostMask &= ~BIT(t);
-            bbp.lostListed &= ~BIT(t);
+            bbp.lostMask &= ~BBP_BIT(t);
+            bbp.lostListed &= ~BBP_BIT(t);
         }
     }
     bbpVerified[t] = verified;
-    bbp.prevMask &= ~BIT(t);
+    bbp.prevMask &= ~BBP_BIT(t);
 }
 
 // All differences of the group are recorded. The group was equal to the shadow at 'verified'.
 static void groupSynced(int t, bbpPoint_t verified)
 {
     bbpVerified[t] = verified;
-    bbp.prevMask &= ~BIT(t);
-    bbp.lostMask &= ~BIT(t);
-    bbp.lostListed &= ~BIT(t);
+    bbp.prevMask &= ~BBP_BIT(t);
+    bbp.lostMask &= ~BBP_BIT(t);
+    bbp.lostListed &= ~BBP_BIT(t);
 }
 
 // The ring did not take all differences of the group: the PID task writes 'L', then 'y' records
@@ -979,8 +1009,8 @@ static void groupLost(int t, bbpPoint_t at)
     if (!(bbp.lostMask & ~bbp.lostListed)) {
         bbp.lostAt = at;
     }
-    bbp.lostMask |= BIT(t);
-    bbp.prevMask &= ~BIT(t);
+    bbp.lostMask |= BBP_BIT(t);
+    bbp.prevMask &= ~BBP_BIT(t);
 }
 
 static bool mapEmpty(const uint32_t *map)
@@ -1044,7 +1074,7 @@ static bool stepGroup(int t, bbpPoint_t at, int32_t *budget)
         step.walk.budget = *budget;
     }
 
-    const char s = (bbp.lostMask & BIT(t)) ? 'y' : (bbp.prevMask & BIT(t)) ? 'v' : 'u';
+    const char s = (bbp.lostMask & BBP_BIT(t)) ? 'y' : (bbp.prevMask & BBP_BIT(t)) ? 'v' : 'u';
     if (!recBegin('C', s, (s == 'y') ? pgN(reg) : BBP_ARG_NONE, intervalStart(t, at), at)) {
         step.t = -1;
         groupLost(t, at);
@@ -1079,7 +1109,7 @@ static void stepGroups(uint32_t mask, bbpPoint_t at, unsigned ringFreeMin)
         if (t < 0 || !stepGroup(t, at, &budget)) {
             return;
         }
-        mask &= ~BIT(t);
+        mask &= ~BBP_BIT(t);
     }
 }
 
@@ -1096,7 +1126,7 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
     int t;
 
     for (t = 0; t < BBP_TRACKED; t++) {
-        if (!(set & BIT(t))) {
+        if (!(set & BBP_BIT(t))) {
             continue;
         }
         if (step.t == t) {
@@ -1115,12 +1145,12 @@ static void capture(bool attributed, char src, uint16_t arg, bbpPoint_t at, uint
         }
         bbpChanges++;
 
-        const bool own = !attributed || ((bbp.lostMask | bbp.prevMask) & BIT(t));
+        const bool own = !attributed || ((bbp.lostMask | bbp.prevMask) & BBP_BIT(t));
         if (own) {
             if (rec.open) {
                 recCommit();
             }
-            const char s = (bbp.lostMask & BIT(t)) ? 'y' : (bbp.prevMask & BIT(t)) ? 'v' : 'u';
+            const char s = (bbp.lostMask & BBP_BIT(t)) ? 'y' : (bbp.prevMask & BBP_BIT(t)) ? 'v' : 'u';
             if (!recBegin('C', s, (s == 'y') ? pgN(reg) : BBP_ARG_NONE, intervalStart(t, at), at)) {
                 goto lost;
             }
@@ -1151,7 +1181,7 @@ lost:
     recCommit();
     groupLost(t, at);
     for (t++; t < BBP_TRACKED; t++) {
-        if (set & BIT(t)) {
+        if (set & BBP_BIT(t)) {
             const bool whole = (slot < 0 || t != slotGroup);
             const unsigned start = whole ? 0 : slot * pgElementSize(bbpPg[t].reg);
             const unsigned end = whole ? pgSize(bbpPg[t].reg) : start + pgElementSize(bbpPg[t].reg);
@@ -1165,11 +1195,27 @@ lost:
     }
 }
 
+/* Journal state is owned by scheduler tasks. SPI receiver MSP can execute in an ISR;
+ * its writes are discovered later by the bounded scan, with an interval rather than a false exact stamp. */
+#ifdef UNIT_TEST
+bool bbpTestInInterrupt;
+#endif
+static bool inInterrupt(void)
+{
+#ifdef UNIT_TEST
+    return bbpTestInInterrupt;
+#elif defined(__arm__) || defined(__thumb__)
+    return __get_IPSR() != 0;
+#else
+    return false;
+#endif
+}
+
 /* Operations */
 
 void blackboxParamsOpBegin(char source, uint16_t arg)
 {
-    if (!bbp.active || bbp.opDepth++ > 0) {
+    if (inInterrupt() || !bbp.active || bbp.opDepth++ > 0) {
         return;
     }
     bbp.opSrc = source;
@@ -1180,7 +1226,7 @@ void blackboxParamsOpBegin(char source, uint16_t arg)
 
 void blackboxParamsOpEnd(void)
 {
-    if (!bbp.active || bbp.opDepth == 0 || --bbp.opDepth > 0) {
+    if (inInterrupt() || !bbp.active || bbp.opDepth == 0 || --bbp.opDepth > 0) {
         return;
     }
     capture(true, bbp.opSrc, bbp.opArg, pointNow(), bbp.allMask, -1, -1);
@@ -1188,30 +1234,59 @@ void blackboxParamsOpEnd(void)
 
 bool blackboxParamsMspBegin(int16_t cmd)
 {
-    switch (cmd) {
-    // No configuration change, or one operation for each command (MSP_MULTIPLE_MSP)
-    case MSP_SET_RAW_RC:
-    case MSP_DATAFLASH_READ:
-    case MSP_SET_PASSTHROUGH:
-    case MSP_SET_RTC:
-    case MSP_SET_TX_INFO:
-    case MSP_SET_RAW_GPS:
-    case MSP_SET_HEADING:
-    case MSP_SET_MOTOR:
-    case MSP_SET_MOTOR_OVERRIDE:
-    case MSP_SET_SERVO_OVERRIDE:
-    case MSP_SET_SERVO_OVERRIDE_ALL:
-    case MSP_SET_MIXER_OVERRIDE:
-    case MSP2_SEND_DSHOT_COMMAND:
-    case MSP_MULTIPLE_MSP:
-    case MSP_REBOOT:
+    if (inInterrupt() || !bbp.active) {
         return false;
-    default:
-        if (!bbp.active) {
-            return false;
-        }
+    }
+    // Only commands that can write tracked configuration. Unknown ids and read requests are free.
+    switch (cmd) {
+    case MSP_SELECT_SETTING:
+    case MSP_COPY_PROFILE:
+    case MSP_SET_ACC_TRIM:
+    case MSP_SET_DEBUG_CONFIG:
+    case MSP_SET_ARMING_CONFIG:
+    case MSP_SET_PID_TUNING:
+    case MSP_SET_RC_TUNING:
+    case MSP_SET_MOTOR_CONFIG:
+    case MSP_SET_SERVO_CONFIGURATION:
+    case MSP_SET_SERVO_CENTER:
+    case MSP_SET_RESET_CURR_PID:
+    case MSP_SET_SENSOR_ALIGNMENT:
+    case MSP_SET_ADVANCED_CONFIG:
+    case MSP_SET_FILTER_CONFIG:
+    case MSP_SET_RPM_FILTER_V2:
+    case MSP_SET_PID_PROFILE:
+    case MSP_SET_RESCUE_PROFILE:
+    case MSP_SET_GOVERNOR_PROFILE:
+    case MSP_SET_SENSOR_CONFIG:
+    case MSP_ACC_CALIBRATION:
+    case MSP_SET_ESC_SENSOR_CONFIG:
+    case MSP_SET_ESC_PARAMETERS:
+    case MSP_EEPROM_WRITE:
+    case MSP_SET_BLACKBOX_CONFIG:
+    case MSP_SET_FEATURE_CONFIG:
+    case MSP_SET_BOARD_ALIGNMENT_CONFIG:
+    case MSP_SET_MIXER_CONFIG:
+    case MSP_SET_MIXER_INPUT:
+    case MSP_SET_MIXER_RULE:
+    case MSP_SET_RX_CONFIG:
+    case MSP_SET_FAILSAFE_CONFIG:
+    case MSP_SET_RXFAIL_CONFIG:
+    case MSP_SET_RSSI_CONFIG:
+    case MSP_SET_RX_MAP:
+    case MSP_SET_RC_CONFIG:
+    case MSP_SET_GOVERNOR_CONFIG:
+    case MSP_SET_VOLTAGE_METER_CONFIG:
+    case MSP_SET_CURRENT_METER_CONFIG:
+    case MSP_SET_BATTERY_CONFIG:
+    case MSP_SET_BATTERY_PROFILE:
+    case MSP_SET_EXPERIMENTAL:
+    case MSP_SET_SERVO_CONFIG:
+    case MSP_RESET_CONF:
+    case MSP2_SET_SMARTFUEL_CONFIG:
         blackboxParamsOpBegin(BBP_SRC_MSP, cmd);
         return true;
+    default:
+        return false;
     }
 }
 
@@ -1243,13 +1318,87 @@ static struct {
 } bbpIdleApply[BBP_LOADER_COUNT];
 static uint32_t bbpIdleApplied;
 
+// Verify idle loader regions in bounded steps during the header, never as one T0 hash sweep.
+static struct {
+    uint32_t revision;
+    uint32_t matched;
+    uint32_t hash;
+    uint16_t offset;
+    uint8_t loader;
+    uint8_t group;
+} idleCheck;
+
+static void idleCheckReset(void)
+{
+    memset(&idleCheck, 0, sizeof(idleCheck));
+    idleCheck.revision = bbpChanges;
+    idleCheck.hash = FNV_OFFSET_BASIS;
+}
+
+static void idleCheckStep(void)
+{
+    if (idleCheck.revision != bbpChanges) {
+        idleCheckReset();
+    }
+    unsigned budget = BBP_SCAN_BYTES;
+    while (budget && idleCheck.loader < BBP_LOADER_COUNT) {
+        const int l = idleCheck.loader;
+        if (!(bbpIdleApplied & BBP_BIT(l))) {
+            idleCheck.loader++;
+            budget--;
+            continue;
+        }
+        if (idleCheck.group == BBP_TRACKED) {
+            if (idleCheck.hash == bbpIdleApply[l].hash) {
+                idleCheck.matched |= BBP_BIT(l);
+            }
+            idleCheck.loader++;
+            idleCheck.group = 0;
+            idleCheck.offset = 0;
+            idleCheck.hash = FNV_OFFSET_BASIS;
+            budget--;
+            continue;
+        }
+        const int t = idleCheck.group;
+        const pgRegistry_t *reg = bbpPg[t].reg;
+        if (!(bbpLoaderRegion[l] & BBP_BIT(t)) || !reg) {
+            idleCheck.group++;
+            budget--;
+            continue;
+        }
+        unsigned start = 0, length = pgSize(reg);
+        const int slot = bbpIdleApply[l].slot;
+        if (t == bbpLoaderSlotGroup(l) && slot >= 0) {
+            start = slot * pgElementSize(reg);
+            length = pgElementSize(reg);
+        }
+        const unsigned count = MIN(budget, length - idleCheck.offset);
+        // The shadow is the state established by the header's completed capture. Any later capture restarts this check.
+#ifdef UNIT_TEST
+        bbpTestHashBytes += count;
+#endif
+        idleCheck.hash = fnv_update(idleCheck.hash, bbpShadow(t) + start + idleCheck.offset, count);
+        idleCheck.offset += count;
+        budget -= count;
+        if (idleCheck.offset == length) {
+            idleCheck.group++;
+            idleCheck.offset = 0;
+        }
+    }
+}
+
+static bool idleCheckComplete(void)
+{
+    return idleCheck.revision == bbpChanges && idleCheck.loader == BBP_LOADER_COUNT;
+}
+
 static uint32_t regionHash(int loader, int slot)
 {
     const int slotGroup = bbpLoaderSlotGroup(loader);
     uint32_t hash = FNV_OFFSET_BASIS;
     for (int t = 0; t < BBP_TRACKED; t++) {
         const pgRegistry_t *reg = bbpPg[t].reg;
-        if (!(bbpLoaderRegion[loader] & BIT(t)) || !reg) {
+        if (!(bbpLoaderRegion[loader] & BBP_BIT(t)) || !reg) {
             continue;
         }
         unsigned start = 0, end = pgSize(reg);
@@ -1257,6 +1406,9 @@ static uint32_t regionHash(int loader, int slot)
             start = slot * pgElementSize(reg);
             end = start + pgElementSize(reg);
         }
+#ifdef UNIT_TEST
+        bbpTestHashBytes += end - start;
+#endif
         hash = fnv_update(hash, reg->address + start, end - start);
     }
     return hash;
@@ -1294,6 +1446,9 @@ static int loaderSlot(int loader, int slot)
 
 void blackboxParamsApplied(bbpLoader_e loader, int slot)
 {
+    if (inInterrupt() || (!bbp.active && blackboxConfig()->params == BLACKBOX_PARAMS_OFF)) {
+        return;
+    }
     bbpChanges++;
     if (!bbp.active) {
         // No log (and blackboxParamsInit has run): keep the hash of what the loader read
@@ -1301,7 +1456,7 @@ void blackboxParamsApplied(bbpLoader_e loader, int slot)
             const int s = loaderSlot(loader, slot);
             bbpIdleApply[loader].slot = s;
             bbpIdleApply[loader].hash = regionHash(loader, s);
-            bbpIdleApplied |= BIT(loader);
+            bbpIdleApplied |= BBP_BIT(loader);
         }
         return;
     }
@@ -1349,7 +1504,7 @@ void blackboxParamsApplied(bbpLoader_e loader, int slot)
 
 void blackboxParamsMarker(bbpMarker_e marker, uint32_t a, uint32_t b)
 {
-    if (bbp.active) {
+    if (!inInterrupt() && bbp.active) {
         const bbpPoint_t at = pointNow();
         const uint32_t values[2] = { a, b };
         recValues('M', marker, BBP_ARG_NONE, at, at, values, 2);
@@ -1358,7 +1513,7 @@ void blackboxParamsMarker(bbpMarker_e marker, uint32_t a, uint32_t b)
 
 bool blackboxParamsActive(void)
 {
-    return bbp.active;
+    return bbp.active && !inInterrupt();
 }
 
 /* Events */
@@ -1412,7 +1567,8 @@ static int endEvent(bbpWriter_t *w, char *line)
 {
     static const char digits[] = "0123456789ABCDEF";
     const int length = w->ptr - line;
-    const uint8_t crc = eventCrc(line, length);
+    const uint8_t crc = w->crcEnabled ? w->crc : eventCrc(line, length);
+    w->crcEnabled = false;
 
     w->end = line + BBP_EVENT_MAX;
     bbpPutChar(w, '*');
@@ -1424,7 +1580,7 @@ static int endEvent(bbpWriter_t *w, char *line)
 
 static bool lostBitNext(uint32_t mask, uint16_t *bit)
 {
-    while (*bit < BBP_TRACKED && !(mask & BIT(*bit))) {
+    while (*bit < BBP_TRACKED && !(mask & BBP_BIT(*bit))) {
         (*bit)++;
     }
     return *bit < BBP_TRACKED;
@@ -1443,7 +1599,7 @@ static void formatEvent(void)
     const uint16_t end = payload + ringGetN(h + REC_LEN, 2);
 
     // Room for "*XX"
-    bbpWriter_t w = { bbpLine, bbpLine + BBP_EVENT_MAX - 3, false };
+    bbpWriter_t w = { bbpLine, bbpLine + BBP_EVENT_MAX - 3, false, 0, true };
 
     bbpPutChar(&w, 'P');
     bbpPutChar(&w, bbp.drainStarted ? '+' : type);
@@ -1473,7 +1629,14 @@ static void formatEvent(void)
             bbpPutUint(&w, ringGetN(h + REC_COUNT, 2));
         }
         int placed = 0;
-        while (pos != end) {
+        for (unsigned items = 0; pos != end && items < BBP_RING_SIZE / 5; items++) {
+            const unsigned remaining = (uint16_t)(end - pos);
+            const unsigned bytes = ringGet(pos + 4);
+            if (remaining < 5 || remaining > BBP_RING_SIZE || bytes > BBP_ITEM_BYTES_MAX || 5 + 2 * bytes > remaining) {
+                bbp.lostRec++;
+                pos = end;
+                break;
+            }
             uint32_t newBytes[BBP_ITEM_BYTES_MAX / 4];
             uint32_t oldBytes[BBP_ITEM_BYTES_MAX / 4];
             const uint16_t code = ringGetN(pos, 2);
@@ -1485,9 +1648,11 @@ static void formatEvent(void)
                 ((uint8_t *)oldBytes)[i] = ringGet(pos + 5 + length + i);
             }
             char *mark = w.ptr;
+            const uint8_t savedCrc = w.crc;
             bbpPutChar(&w, ' ');
             if (!bbpPutItem(&w, code, slot, index, (uint8_t *)newBytes, (uint8_t *)oldBytes, length)) {
                 w.ptr = mark;
+                w.crc = savedCrc;
                 w.overflow = false;
                 if (placed == 0 && bbp.drainStarted) {
                     // Cannot happen: an item fits in a continuation. Do not stall on it.
@@ -1518,7 +1683,7 @@ static void formatEvent(void)
     case 'R': {
         const uint8_t mask = src;
         for (int i = 0; i < BBP_RT_COUNT; i++) {
-            if (mask & BIT(i)) {
+            if (mask & BBP_BIT(i)) {
                 const uint32_t value = ringGetN(pos, 4);
                 pos += 4;
                 bbpPutChar(&w, ' ');
@@ -1558,12 +1723,14 @@ static void formatEvent(void)
         bool first = true;
         while (lostBitNext(mask, &bit)) {
             char *mark = w.ptr;
+            const uint8_t savedCrc = w.crc;
             if (!first) {
                 bbpPutChar(&w, ',');
             }
             bbpPutUint(&w, pgN(bbpPg[bit].reg));
             if (w.overflow) {
                 w.ptr = mark;
+                w.crc = savedCrc;
                 w.overflow = false;
                 break;
             }
@@ -1633,12 +1800,12 @@ static void writeLost(void)
  */
 static void scanStep(bbpPoint_t now)
 {
-    for (int i = 0; i < BBP_TRACKED && !(bbp.allMask & BIT(bbp.scanPg)); i++) {
+    for (int i = 0; i < BBP_TRACKED && !(bbp.allMask & BBP_BIT(bbp.scanPg)); i++) {
         bbp.scanPg = (bbp.scanPg + 1) % BBP_TRACKED;
         bbp.scanOff = 0;
     }
     const int t = bbp.scanPg;
-    if (!(bbp.allMask & BIT(t))) {
+    if (!(bbp.allMask & BBP_BIT(t))) {
         return;
     }
 
@@ -1650,7 +1817,7 @@ static void scanStep(bbpPoint_t now)
 
     if (groupDiffers(t, bbp.scanOff, end)) {
         // A capture in steps: the next logged iterations go on with it
-        stepGroups(BIT(t), now, 0);
+        stepGroups(BBP_BIT(t), now, 0);
         bbp.scanOff = size;
     } else if (end >= size) {
         if (pointAfter(bbp.scanPassStart, bbpVerified[t])) {
@@ -1678,7 +1845,7 @@ static void pollOneRuntime(bbpPoint_t now)
         if (ringFree() < BBP_REC_HEADER + 4 + BBP_RING_KEEP) {
             return;
         }
-        recValues('R', BIT(i), BBP_ARG_NONE, bbp.rtPolled[i], now, &value, 1);
+        recValues('R', BBP_BIT(i), BBP_ARG_NONE, bbp.rtPolled[i], now, &value, 1);
         bbp.rtLast[i] = value;
     }
     bbp.rtPolled[i] = now;
@@ -1790,14 +1957,20 @@ void blackboxParamsStart(void)
         recValues('M', BBP_MARKER_SHADOW_RESET, BBP_ARG_NONE, pointPre, pointPre, values, 2);
     }
 
+    idleCheckReset();
     bbpHeaderBegin(mode != BLACKBOX_PARAMS_CHANGES);
 }
 
 // One step of the 'v' compare in each header iteration. The section ends after the compare.
 void blackboxParamsHeaderTick(void)
 {
-    if (bbp.active && bbp.prevMask) {
+    if (!bbp.active) {
+        return;
+    }
+    if (bbp.prevMask) {
         stepGroups(bbp.prevMask, pointPre, 0);
+    } else {
+        idleCheckStep();
     }
 }
 
@@ -1823,10 +1996,14 @@ bool blackboxParamsWriteHeader(void)
                 break;
             }
             const int length = bbpHeaderNextLine(bbpLine);
+            if (length == 0) {
+                // The formatter exhausted its work budget. Do not start another scan in this PID iteration.
+                return false;
+            }
             if (length < 0) {
                 // The 'v' compare is in the PID task, in steps: T0 waits for it. A call that ends the section writes
                 // nothing.
-                return room == start && !bbp.prevMask;
+                return room == start && !bbp.prevMask && idleCheckComplete();
             }
             bbp.lineLength = length;
             bbp.linePos = 0;
@@ -1849,13 +2026,12 @@ void blackboxParamsRunning(void)
     if (!bbp.active) {
         return;
     }
-    if (bbp.prevMask) {
-        capture(false, 'v', BBP_ARG_NONE, pointPre, bbp.prevMask, -1, -1);
-    }
+    // The header gate has completed the bounded capture and idle-loader verification.
+    // If a write occurred during CACHE_FLUSH, withhold inferred application records.
 
     // The loaders that ran with no log and read the values of the T0 state: 'A' records stamped p, after the 'v' records
     for (int l = 0; l < BBP_LOADER_COUNT; l++) {
-        if ((bbpIdleApplied & BIT(l)) && regionHash(l, bbpIdleApply[l].slot) == bbpIdleApply[l].hash) {
+        if (idleCheckComplete() && (idleCheck.matched & BBP_BIT(l))) {
             uint32_t fp;
             const int count = loaderFingerprint(l, &fp);
             recValues('A', l, (bbpIdleApply[l].slot >= 0) ? bbpIdleApply[l].slot : BBP_ARG_NONE, pointPre, pointPre, &fp, count);
@@ -1871,7 +2047,7 @@ void blackboxParamsRunning(void)
         bbp.rtLast[i] = values[i];
         bbp.rtPolled[i] = first;
     }
-    recValues('R', BIT(BBP_RT_COUNT) - 1, BBP_ARG_NONE, pointPre, pointPre, values, BBP_RT_COUNT);
+    recValues('R', BBP_BIT(BBP_RT_COUNT) - 1, BBP_ARG_NONE, pointPre, pointPre, values, BBP_RT_COUNT);
     bbp.rtIndex = 0;
     bbp.rtTick = 0;
 
@@ -1903,12 +2079,23 @@ void blackboxParamsEnd(void)
 
     // Records that are not completely written
     unsigned unsent = 0;
-    for (uint16_t h = bbp.ringTail; h != bbp.ringHead; h += BBP_REC_HEADER + ringGetN(h + REC_LEN, 2)) {
+    uint16_t h = bbp.ringTail;
+    unsigned remaining = (uint16_t)(bbp.ringHead - h);
+    for (unsigned records = 0; remaining && records < BBP_RING_SIZE / BBP_REC_HEADER + 1; records++) {
         unsent++;
+        if (remaining < BBP_REC_HEADER || remaining > BBP_RING_SIZE) {
+            break;
+        }
+        const unsigned size = BBP_REC_HEADER + ringGetN(h + REC_LEN, 2);
+        if (size > remaining) {
+            break;
+        }
+        h += size;
+        remaining -= size;
     }
 
     const bbpPoint_t at = { blackboxGetIteration(), 0 };
-    bbpWriter_t w = { bbpLine, bbpLine + BBP_EVENT_MAX - 3, false };
+    bbpWriter_t w = { bbpLine, bbpLine + BBP_EVENT_MAX - 3, false, 0, true };
     bbpPutStr(&w, "PQ");
     bbpPutHex(&w, ++bbp.seq);
     bbpPutChar(&w, ' ');
@@ -1942,5 +2129,57 @@ uint32_t blackboxParamsChangeCount(void)
 {
     return bbpChanges;
 }
+
+
+#ifdef BBP_PROFILE_ENABLED
+#undef blackboxParamsHeaderTick
+#undef blackboxParamsWriteHeader
+#undef blackboxParamsRunning
+#undef blackboxParamsAfterFrame
+#undef blackboxParamsOpBegin
+#undef blackboxParamsOpEnd
+void blackboxParamsHeaderTick(void)
+{
+    const uint32_t start = DWT->CYCCNT;
+    bbpInnerHeaderTick();
+    bbpProfileRecord(0, start);
+}
+bool blackboxParamsWriteHeader(void)
+{
+    const uint32_t start = DWT->CYCCNT;
+    const bool done = bbpInnerWriteHeader();
+    bbpProfileRecord(1, start);
+    return done;
+}
+void blackboxParamsRunning(void)
+{
+    const uint32_t start = DWT->CYCCNT;
+    bbpInnerRunning();
+    bbpProfileRecord(2, start);
+}
+void blackboxParamsAfterFrame(void)
+{
+    const uint32_t start = DWT->CYCCNT;
+    bbpInnerAfterFrame();
+    bbpProfileRecord(3, start);
+}
+void blackboxParamsOpBegin(char source, uint16_t arg)
+{
+    if (__get_IPSR()) { bbpInnerOpBegin(source, arg); return; }
+    const uint32_t start = DWT->CYCCNT;
+    if (bbp.active && bbp.opDepth == 0) bbpProfileOpStart = start;
+    bbpInnerOpBegin(source, arg);
+    bbpProfileRecord(4, start);
+}
+void blackboxParamsOpEnd(void)
+{
+    if (__get_IPSR()) { bbpInnerOpEnd(); return; }
+    const uint32_t start = DWT->CYCCNT;
+    const bool outer = bbp.active && bbp.opDepth == 1;
+    bbpInnerOpEnd();
+    bbpProfileRecord(5, start);
+    if (outer) bbpProfileRecord(6, bbpProfileOpStart);
+}
+#endif
 
 #endif

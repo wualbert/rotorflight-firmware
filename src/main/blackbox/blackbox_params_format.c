@@ -88,6 +88,13 @@ void bbpPutChar(bbpWriter_t *w, char c)
 {
     if (w->ptr < w->end) {
         *w->ptr++ = c;
+        if (w->crcEnabled) {
+            static const uint8_t table[16] = { 0x00, 0xd5, 0x7f, 0xaa, 0xfe, 0x2b, 0x81, 0x54,
+                                              0x29, 0xfc, 0x56, 0x83, 0xd7, 0x02, 0xa8, 0x7d };
+            w->crc ^= (uint8_t)c;
+            w->crc = (uint8_t)(w->crc << 4) ^ table[w->crc >> 4];
+            w->crc = (uint8_t)(w->crc << 4) ^ table[w->crc >> 4];
+        }
     } else {
         w->overflow = true;
     }
@@ -217,7 +224,7 @@ void bbpPutValue(bbpWriter_t *w, const clivalue_t *v, const void *p)
         break;
     }
     case MODE_BITSET:
-        bbpPutStr(w, ((uint32_t)readValue(v, p, 0) & BIT(v->config.bitpos)) ? "ON" : "OFF");
+        bbpPutStr(w, ((uint32_t)readValue(v, p, 0) & BBP_BIT(v->config.bitpos)) ? "ON" : "OFF");
         break;
     case MODE_STRING:
         putString(w, p, v->config.string.maxlength);
@@ -444,64 +451,46 @@ bool bbpPutItem(bbpWriter_t *w, uint16_t code, uint8_t slot, uint8_t index, cons
 
 /* Coverage: the bytes of a group that a set or element line gives */
 
-#define BBP_COVERAGE_UNIT_MAX   256
-
-// The coverage of one group, for one unit: the whole group, or one element when each element has the same layout
-static struct {
-    int8_t      t;                                  // the group, or -1
-    uint16_t    unitSize;
-    uint8_t     bits[BBP_COVERAGE_UNIT_MAX / 8];    // bit i: byte i of the unit is covered
-} coverage = { .t = -1 };
-
-static void markCoverage(unsigned start, unsigned width)
+static void markCoverage(int t, unsigned start, unsigned width)
 {
-    for (unsigned i = start; i < start + width && i < BBP_COVERAGE_UNIT_MAX; i++) {
-        coverage.bits[i >> 3] |= BIT(i & 7);
+    const unsigned size = pgSize(bbpPg[t].reg);
+    for (unsigned i = start; i < start + width && i < size; i++) {
+        bbpPg[t].coverage[i >> 3] |= BBP_BIT(i & 7);
     }
 }
 
-static void buildCoverage(int t)
+void bbpCoverageInit(void)
 {
-    const bbpPg_t *pg = &bbpPg[t];
-    const pgn_t pgn = pgN(pg->reg);
-    const unsigned elementSize = pgElementSize(pg->reg);
-    const bbpElementKind_t *kind = bbpElementKind(pgn);
-    bool perElement = (pg->reg->length > 1);
-
-    for (unsigned i = pg->vtFirst; i < pg->vtEnd; i++) {
-        const int section = valueTable[i].type & VALUE_SECTION_MASK;
-        if (valueTable[i].pgn == pgn && section != PROFILE_VALUE && section != PROFILE_RATE_VALUE) {
-            perElement = false;     // offsets in the whole group
-        }
-    }
-
-    coverage.t = t;
-    coverage.unitSize = perElement ? elementSize : pgSize(pg->reg);
-    memset(coverage.bits, 0, sizeof(coverage.bits));
-
-    // A unit that is too large stays uncovered: all its bytes are given as raw hex
-    if (coverage.unitSize > BBP_COVERAGE_UNIT_MAX) {
-        return;
-    }
-
-    const unsigned instances = perElement ? 1 : pg->reg->length;
-    for (unsigned i = pg->vtFirst; i < pg->vtEnd; i++) {
-        const clivalue_t *v = &valueTable[i];
-        if (v->pgn != pgn || !bbpEntryInHeader(t, v)) {
+    unsigned offset = 0;
+    for (int t = 0; t < BBP_TRACKED; t++) {
+        bbpPg_t *pg = &bbpPg[t];
+        const unsigned bytes = (bbpTrackedPgs[t].size + 7) / 8;
+        pg->coverage = bbpCoverage + offset;
+        offset += bytes;
+        memset(pg->coverage, 0, bytes);
+        if (!pg->reg) {
             continue;
         }
-        const int section = v->type & VALUE_SECTION_MASK;
-        const unsigned count = (section == PROFILE_VALUE || section == PROFILE_RATE_VALUE) ? instances : 1;
-        for (unsigned k = 0; k < count; k++) {
-            markCoverage(v->offset + k * elementSize, bbpValueWidth(v));
+        const pgn_t pgn = pgN(pg->reg);
+        const unsigned elementSize = pgElementSize(pg->reg);
+        for (unsigned i = pg->vtFirst; i < pg->vtEnd; i++) {
+            const clivalue_t *v = &valueTable[i];
+            if (v->pgn != pgn || !bbpEntryInHeader(t, v)) {
+                continue;
+            }
+            const int section = v->type & VALUE_SECTION_MASK;
+            const unsigned count = (section == PROFILE_VALUE || section == PROFILE_RATE_VALUE) ? pg->reg->length : 1;
+            for (unsigned k = 0; k < count; k++) {
+                markCoverage(t, v->offset + k * elementSize, bbpValueWidth(v));
+            }
         }
-    }
-
-    if (kind) {
-        const unsigned count = (perElement || !kind->indexed) ? 1 : pg->reg->length;
-        for (unsigned k = 0; k < count; k++) {
-            for (int f = 0; f < kind->fieldCount; f++) {
-                markCoverage(k * elementSize + kind->fields[f].offset, bbpFieldWidth(&kind->fields[f]));
+        const bbpElementKind_t *kind = bbpElementKind(pgn);
+        if (kind) {
+            const unsigned count = kind->indexed ? pg->reg->length : 1;
+            for (unsigned k = 0; k < count; k++) {
+                for (int f = 0; f < kind->fieldCount; f++) {
+                    markCoverage(t, k * elementSize + kind->fields[f].offset, bbpFieldWidth(&kind->fields[f]));
+                }
             }
         }
     }
@@ -509,11 +498,7 @@ static void buildCoverage(int t)
 
 bool bbpByteCovered(int t, unsigned offset)
 {
-    if (coverage.t != t) {
-        buildCoverage(t);
-    }
-    const unsigned i = offset % coverage.unitSize;
-    return (i < BBP_COVERAGE_UNIT_MAX) && (coverage.bits[i >> 3] & BIT(i & 7));
+    return offset < bbpTrackedPgs[t].size && (bbpPg[t].coverage[offset >> 3] & BBP_BIT(offset & 7));
 }
 
 /* Header section */
@@ -538,10 +523,8 @@ enum {
     HDR_DONE,
 };
 
-// The work of one call at most, in valueTable entries or elements. 16 raw bytes count as one entry, and the
-// coverage of a group (one pass over its entries) as 32.
+// Bound each call by entries, elements or individual raw bytes examined. Coverage is precomputed at init.
 #define HDR_WORK_PER_CALL       64
-#define HDR_WORK_PER_COVERAGE   32
 
 static struct {
     uint8_t     stage;
@@ -565,6 +548,7 @@ static void beginLine(bbpWriter_t *w, char *line, const char *key)
     w->ptr = line;
     w->end = line + BBP_LINE_MAX - 1;   // room for '\n'
     w->overflow = false;
+    w->crcEnabled = false;
     bbpPutStr(w, "H ");
     bbpPutStr(w, key);
 }
@@ -617,11 +601,8 @@ static int nextRawRun(int t, uint16_t *offset, unsigned *start, unsigned *count,
 {
     const unsigned size = pgSize(bbpPg[t].reg);
 
-    if (coverage.t != t) {
-        *work += HDR_WORK_PER_COVERAGE;
-    }
-    for (unsigned scanned = 0; *offset < size && bbpByteCovered(t, *offset); scanned++) {
-        if ((scanned & 15) == 15 && ++*work > HDR_WORK_PER_CALL) {
+    while (*offset < size && bbpByteCovered(t, *offset)) {
+        if (++*work > HDR_WORK_PER_CALL) {
             return -1;
         }
         (*offset)++;
@@ -661,7 +642,7 @@ static uint8_t profileIndex(const void *profile, const void *first, size_t size)
     return ((const uint8_t *)profile - (const uint8_t *)first) / size;
 }
 
-int bbpHeaderNextLine(char *line)
+static int headerNextLine(char *line)
 {
     static const char * const subtaskNames[CORE_ST_COUNT] = {
         "pos", "sp", "pid", "mix", "mot", "fupd", "bb", "flush"
@@ -1021,6 +1002,23 @@ int bbpHeaderNextLine(char *line)
             return -1;
         }
     }
+}
+
+#ifdef UNIT_TEST
+unsigned bbpTestHeaderCalls, bbpTestLastHeaderYield;
+#endif
+int bbpHeaderNextLine(char *line)
+{
+#ifdef UNIT_TEST
+    bbpTestHeaderCalls++;
+#endif
+    const int length = headerNextLine(line);
+#ifdef UNIT_TEST
+    if (length == 0) {
+        bbpTestLastHeaderYield = bbpTestHeaderCalls;
+    }
+#endif
+    return length;
 }
 
 #endif

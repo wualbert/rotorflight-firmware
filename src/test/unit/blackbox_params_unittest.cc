@@ -66,6 +66,11 @@ extern "C" {
 
     #include "blackbox_params_unittest_cli.h"
 
+    #include "msp/msp_protocol.h"
+    #include "msp/msp_protocol_v2_rotorflight.h"
+    extern bool bbpTestInInterrupt;
+    extern unsigned bbpTestHashBytes, bbpTestHeaderCalls, bbpTestLastHeaderYield;
+
     // Stubs of the firmware
     uint8_t activePidLoopDenom = 2;
     uint8_t activeFilterLoopDenom = 2;
@@ -141,6 +146,7 @@ static const pgRegistry_t *trackedReg(int t) { return bbpPg[t].reg; }
 
 static void resetSim(void)
 {
+    bbpTestInInterrupt = false;
     sim.running = false;
     sim.iteration = 0;
     sim.counter = 0;
@@ -1777,10 +1783,16 @@ TEST(BlackboxParamsJournalTest, BeforeT0AndBetweenLogs)
     j = parseJournal(sim.events);
     expectNoErrors(j);
     const JRecord *m = findRecord(j, 'M');
+#ifdef BLACKBOX_PARAMS_OWN_SHADOW
+    // CLI copy buffers do not alias the private journal shadow.
+    EXPECT_EQ(nullptr, m);
+    EXPECT_EQ(1, countRecords(j, 'C', "v"));
+#else
     ASSERT_NE(nullptr, m);
     EXPECT_EQ("shadow-reset", m->words.at(0));
     EXPECT_EQ(1u, m->seq);
     EXPECT_EQ(0, countRecords(j, 'C'));
+#endif
 }
 
 // e2e proposal P2: a loader that runs while no log is open gives an 'A' record stamped p at the next T0, after the 'v'
@@ -2373,4 +2385,119 @@ TEST(BlackboxParamsJournalTest, MarkersAndLoaderOutsideAnOperation)
     EXPECT_EQ("mix", a.words.at(0));
     EXPECT_EQ("30.0", a.at);
     EXPECT_LT(u->seq, a.seq);
+}
+
+
+TEST(BlackboxParamsTest, HeaderYieldsWithoutStartingAnotherScan)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    blackboxParamsStart();
+    unsigned yields = 0;
+    bool complete = false;
+    for (int call = 0; call < 10000 && !complete; call++) {
+        const unsigned hashBefore = bbpTestHashBytes;
+        blackboxParamsHeaderTick();
+        EXPECT_LE(bbpTestHashBytes - hashBefore, BBP_SCAN_BYTES);
+        blackboxHeaderBudget = 256;
+        const unsigned yieldBefore = bbpTestLastHeaderYield;
+        complete = blackboxParamsWriteHeader();
+        if (bbpTestLastHeaderYield != yieldBefore) {
+            yields++;
+            EXPECT_EQ(bbpTestLastHeaderYield, bbpTestHeaderCalls);
+        }
+    }
+    EXPECT_TRUE(complete);
+    EXPECT_GT(yields, 0u);
+}
+
+TEST(BlackboxParamsJournalTest, IdleLoaderVerificationIsBoundedAndInvalidatedByWrites)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    for (int l = 0; l < BBP_LOADER_COUNT; l++) {
+        blackboxParamsApplied((bbpLoader_e)l, 0);
+    }
+    runHeader();
+    const unsigned hashBefore = bbpTestHashBytes;
+    runningLog();
+    EXPECT_EQ(hashBefore, bbpTestHashBytes); // T0 never hashes configuration regions
+    drainJournal();
+    expectNoErrors(parseJournal(sim.events));
+
+    blackboxParamsStop();
+    blackboxParamsApplied(BBP_LOADER_PID, 0);
+    sim.events.clear();
+    runHeader();
+    // A write after the header, while buffers flush, invalidates inferred applications.
+    blackboxParamsOpBegin(BBP_SRC_MSP, MSP_SET_PID_TUNING);
+    pidProfilesMutable(0)->pid[0].P++;
+    blackboxParamsOpEnd();
+    runningLog();
+    drainJournal();
+    EXPECT_EQ(0, countRecords(parseJournal(sim.events), 'A'));
+}
+
+TEST(BlackboxParamsJournalTest, ReadOnlyMspCommandsDoNotTouchTheJournal)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader(); runningLog(); drainJournal();
+    const uint32_t seq = blackboxParamsSeq();
+    for (int cmd : { MSP_BOXNAMES, MSP_BOXIDS, MSP_GET_SERVO_CONFIG, MSP_GET_MIXER_INPUT,
+                     MSP_GET_ADJUSTMENT_RANGE, MSP_RPM_FILTER_V2, MSP_MULTIPLE_MSP, 32000 }) {
+        EXPECT_FALSE(blackboxParamsMspBegin(cmd)) << cmd;
+    }
+    EXPECT_EQ(seq, blackboxParamsSeq());
+    for (int cmd : { MSP_SET_SERVO_CONFIG, MSP_RESET_CONF, MSP_SET_PID_TUNING, MSP2_SET_SMARTFUEL_CONFIG }) {
+        EXPECT_TRUE(blackboxParamsMspBegin(cmd)) << cmd;
+        blackboxParamsOpEnd();
+    }
+}
+
+TEST(BlackboxParamsJournalTest, InterruptWritesCannotReenterAnOperation)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    Decoded d = decodeHeader(runHeader());
+    runningLog(); drainJournal();
+    const uint32_t seq = blackboxParamsSeq();
+    bbpTestInInterrupt = true;
+    EXPECT_FALSE(blackboxParamsMspBegin(MSP_SET_PID_TUNING));
+    blackboxParamsOpBegin(BBP_SRC_MSP, MSP_SET_PID_TUNING);
+    pidProfilesMutable(0)->pid[0].P++;
+    blackboxParamsApplied(BBP_LOADER_PID, 0);
+    blackboxParamsMarker(BBP_MARKER_EESAVE, 123, 0);
+    blackboxParamsOpEnd();
+    EXPECT_FALSE(blackboxParamsActive());
+    EXPECT_EQ(seq, blackboxParamsSeq());
+    bbpTestInInterrupt = false;
+    for (int i = 0; i < 300; i++) logFrame();
+    drainJournal();
+    const Journal j = parseJournal(sim.events);
+    expectNoErrors(j);
+    EXPECT_EQ(1, countRecords(j, 'C', "u"));
+    EXPECT_EQ(0, countRecords(j, 'A'));
+    std::vector<std::string> errors;
+    applyJournal(d, j, errors);
+    EXPECT_TRUE(errors.empty());
+    expectStateIsLive(d);
+}
+
+TEST(BlackboxParamsJournalTest, OffDoesNotHashLoaderRegions)
+{
+    setupConfig(BLACKBOX_PARAMS_OFF);
+    const unsigned before = bbpTestHashBytes;
+    for (int l = 0; l < BBP_LOADER_COUNT; l++) blackboxParamsApplied((bbpLoader_e)l, 0);
+    EXPECT_EQ(before, bbpTestHashBytes);
+}
+
+TEST(BlackboxParamsJournalTest, EventKeepsAtLeastHalfTheFlashBufferFree)
+{
+    setupConfig(BLACKBOX_PARAMS_FULL);
+    runHeader(); runningLog();
+    sim.freeSpace = 256;
+    for (int i = 0; i < 100; i++) logFrame();
+    EXPECT_TRUE(sim.events.empty());
+    sim.freeSpace = 512;
+    drainJournal();
+    ASSERT_FALSE(sim.events.empty());
+    for (const auto &event : sim.events) EXPECT_LE(event.size() + 3 + 256, 512u);
+    expectNoErrors(parseJournal(sim.events));
 }

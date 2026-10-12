@@ -3111,7 +3111,9 @@ static mspResult_e mspProcessInCommand(mspDescriptor_t srcDesc, int16_t cmdMSP, 
                 return MSP_RESULT_ERROR;
 
             // The ESC parameters are not in the configuration: their length and hash only
-            blackboxParamsMarker(BBP_MARKER_ESCPARAM, len, fnv_update(FNV_OFFSET_BASIS, escGetParamUpdBuffer(), len));
+            if (blackboxParamsActive()) {
+                blackboxParamsMarker(BBP_MARKER_ESCPARAM, len, fnv_update(FNV_OFFSET_BASIS, escGetParamUpdBuffer(), len));
+            }
         }
         break;
     

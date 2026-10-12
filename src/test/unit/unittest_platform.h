@@ -127,3 +127,7 @@ typedef struct
 #include "target.h"
 
 #include "target/common_defaults_post.h"
+
+// Cortex-M trace output has no peripheral in the host test process.
+#define ITM ((void *)0)
+static inline void ITM_SendChar(unsigned int ch) { (void)ch; }

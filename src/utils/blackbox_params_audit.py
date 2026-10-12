@@ -8,7 +8,7 @@
 #     currentControlRateProfile->, or a use of <group>_System / _SystemArray outside src/main/pg.
 #  2. The loader regions (blackbox_params_tables.c) cover the tracked groups that each loader and its callees read.
 #  3. pgRegistry_t.copy (the shadow) is used only in cli.c and the blackbox_params files.
-#  4. The MSP skip list of blackboxParamsMspBegin() is the list of spec section 3.10 (docs/Blackbox_Params_Spec.md).
+#  4. The MSP tracked-write allowlist covers mutation cases and matches spec section 3.10 (docs/Blackbox_Params_Spec.md).
 #
 # The call graph comes from the text of src/main. Of each #if group the first branch counts; write sites in
 # other branches are listed for a manual check. Static inline functions in headers are not followed. Functions that are
@@ -434,44 +434,68 @@ def main():
     print('only cli.c and blackbox_params: %s' % ('yes' if not bad else 'NO: ' + ', '.join(bad)))
 
     # 4. The MSP skip list
-    print('\n== MSP skip list of blackboxParamsMspBegin() against spec 3.10')
-    skip_bad = check_skip_list()
+    print('\n== MSP tracked-write allowlist and reachable writers')
+    skip_bad = check_skip_list(functions, write_patterns)
 
-    print('\nsummary: %d writer functions, %d with a gap; %d loader regions with missing groups; copy %s; skip list %s' %
+    print('\nsummary: %d writer functions, %d with a gap; %d loader regions with missing groups; copy %s; MSP allowlist %s' %
           (len(rows), gaps, region_gaps, 'ok' if not bad else 'misused', 'ok' if not skip_bad else 'differs'))
     return 1 if (gaps or region_gaps or bad or skip_bad) else 0
 
 
-def check_skip_list():
-    """The commands without an operation: the case labels before 'return false' in blackboxParamsMspBegin()"""
+def check_skip_list(functions, write_patterns):
+    """Check the declared allowlist and every MSP case with reachable tracked writes."""
     code = strip_comments_and_strings(open(os.path.join(ROOT, 'blackbox', 'blackbox_params.c')).read())
-    m = re.search(r'bool blackboxParamsMspBegin\(.*?\{(.*?)return false;', code, re.S)
+    m = re.search(r'bool blackboxParamsMspBegin\(.*?\{(.*?)\nstatic uint32_t runtimeValue', code, re.S)
     if not m:
         print('blackboxParamsMspBegin() not found')
         return True
-    in_code = set(re.findall(r'case MSP2?_(\w+):', m.group(1)))
-
+    allowed = set(re.findall(r'case (MSP\w+):', m.group(1)))
     spec_path = os.path.join(ROOT, '..', '..', 'docs', 'Blackbox_Params_Spec.md')
-    if not os.path.exists(spec_path):
-        print('spec not found (%s): not checked' % os.path.normpath(spec_path))
-        return False
-    s = re.search(r'The skip list is (.*?)\.(?:\s|\|)', open(spec_path, encoding='utf-8').read())
-    if not s:
-        print('the skip list sentence of section 3.10 not found in the spec')
+    spec = open(spec_path, encoding='utf-8').read()
+    declaration = re.search(r'MSP tracked-write allowlist: `([^`]+)`', spec)
+    if not declaration:
+        print('MSP allowlist declaration missing from spec')
         return True
-    in_spec = set()
-    for name in re.split(r',\s*|\s+and\s+', s.group(1)):
-        name = name.strip()
-        opt = re.match(r'(\w+)\((\w+)\)$', name)
-        if opt:
-            in_spec |= {opt.group(1), opt.group(1) + opt.group(2)}
-        elif name:
-            in_spec.add(name)
+    declared = set(declaration.group(1).split(', '))
 
-    for name in sorted(in_code | in_spec):
-        print('  %-24s %s' % (name, 'OK' if name in in_code and name in in_spec else
-                               'NOT IN THE SPEC' if name in in_code else 'NOT IN THE CODE'))
-    return in_code != in_spec
+    def writes_tracked(body, seen=None):
+        seen = set() if seen is None else seen
+        if any(pat.search(body) for _, pat in write_patterns):
+            return True
+        for call in CALL.finditer(body):
+            name = call.group(1)
+            if name in seen or name.startswith('blackboxParams') or name in KNOWN:
+                continue
+            seen.add(name)
+            for function in functions.get(name, []):
+                if writes_tracked(function.body, seen):
+                    return True
+        return False
+
+    required = set()
+    for name in ['mspProcessInCommand', 'mspCommonProcessInCommand', 'mspFcProcessOutCommandWithArg']:
+        for function in functions.get(name, []):
+            labels = list(re.finditer(r'case (MSP\w+):', function.body))
+            for i, label in enumerate(labels):
+                end = labels[i + 1].start() if i + 1 < len(labels) else len(function.body)
+                body = function.body[label.end():end]
+                body = re.split(r'\n    default:', body)[0]
+                if label.group(1) == 'MSP_MULTIPLE_MSP' and re.search(r'\bmspFcProcessCommand\s*\(', body):
+                    # Each nested command goes through the same checked dispatcher.
+                    continue
+                if writes_tracked(body):
+                    required.add(label.group(1))
+    missing = required - allowed
+    forbidden = {'MSP_SET_RAW_RC', 'MSP_DATAFLASH_READ', 'MSP_SET_PASSTHROUGH', 'MSP_MULTIPLE_MSP',
+                 'MSP_REBOOT', 'MSP_BOXNAMES', 'MSP_BOXIDS', 'MSP_GET_SERVO_CONFIG', 'MSP_GET_MIXER_INPUT',
+                 'MSP_GET_ADJUSTMENT_RANGE', 'MSP_RPM_FILTER_V2', 'MSP2_SEND_DSHOT_COMMAND'}
+    for name in sorted(required | allowed):
+        print('  %-32s %s' % (name, 'MISSING BRACKET' if name in missing else 'OK'))
+    if allowed != declared:
+        print('allowlist/spec mismatch:', sorted(allowed ^ declared))
+    if allowed & forbidden:
+        print('read or passthrough commands instrumented:', sorted(allowed & forbidden))
+    return bool(missing or allowed != declared or allowed & forbidden)
 
 
 if __name__ == '__main__':

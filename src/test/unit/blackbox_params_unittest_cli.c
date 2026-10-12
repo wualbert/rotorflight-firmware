@@ -31,7 +31,6 @@
 
 // tfp_format() of the CLI. printf.c also has the serial and ITM outputs, which are not in the unit test.
 #define ITM_SendChar(c) UNUSED(c)
-#define ITM NULL
 #include "common/printf.c"
 
 serialPort_t *openSerialPort(serialPortIdentifier_e identifier, serialPortFunction_e function, serialReceiveCallbackPtr rxCallback,

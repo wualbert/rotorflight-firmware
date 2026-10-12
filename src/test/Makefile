@@ -177,6 +177,10 @@ blackbox_params_short_unittest_DEFINES := \
 blackbox_params_short_unittest_INCLUDE_DIRS := \
 		$(OBJECT_DIR)/blackbox_params_short_unittest
 
+blackbox_params_owned_unittest_SRC := $(blackbox_params_unittest_SRC)
+blackbox_params_owned_unittest_DEFINES := $(blackbox_params_unittest_DEFINES) BLACKBOX_PARAMS_OWN_SHADOW
+blackbox_params_owned_unittest_INCLUDE_DIRS := $(OBJECT_DIR)/blackbox_params_owned_unittest
+
 blackbox_encoding_unittest_SRC :=  \
 		$(USER_DIR)/blackbox/blackbox_encoding.c \
 		$(USER_DIR)/common/encoding.c \
@@ -582,7 +586,8 @@ flashfs_unittest_SRC := \
 		$(TEST_DIR)/flashfs_unittest.include/flash_c_stub.cc
 
 flashfs_unittest_DEFINES := \
-		USE_FLASHFS_LOOP
+		USE_FLASHFS_LOOP \
+		BLACKBOX_PARAMS_PROFILE
 
 setpoint_unittest_SRC := \
         $(USER_DIR)/flight/setpoint.c \
@@ -672,6 +677,12 @@ endif
 
 ifdef USE_PTHREAD
 COMMON_FLAGS += -pthread
+endif
+
+# Optional host memory/undefined-behaviour checks. Use a separate OBJECT_DIR.
+ifneq ($(SANITIZE),)
+COMMON_FLAGS += -fsanitize=$(SANITIZE) -fno-omit-frame-pointer -fsanitize-ignorelist=$(TEST_DIR)/sanitizer.ignore
+LDFLAGS += -fsanitize=$(SANITIZE)
 endif
 
 # Flags passed to the C compiler.
@@ -965,3 +976,5 @@ $(OBJECT_DIR)/%/cli_print_value.inc: $(USER_DIR)/cli/cli.c
 
 $(OBJECT_DIR)/blackbox_params_unittest/blackbox_params_unittest_cli.c.o: $(OBJECT_DIR)/blackbox_params_unittest/cli_print_value.inc
 $(OBJECT_DIR)/blackbox_params_short_unittest/blackbox_params_unittest_cli.c.o: $(OBJECT_DIR)/blackbox_params_short_unittest/cli_print_value.inc
+
+$(OBJECT_DIR)/blackbox_params_owned_unittest/blackbox_params_unittest_cli.c.o: $(OBJECT_DIR)/blackbox_params_owned_unittest/cli_print_value.inc

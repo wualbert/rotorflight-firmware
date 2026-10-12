@@ -1306,7 +1306,7 @@ void blackboxCheckEnabler(timeUs_t currentTimeUs)
             FALLTHROUGH;
         case BLACKBOX_STATE_PAUSED:
             // The parameter journal can hold the end of the log for 100 ms, while records wait
-            if (blackboxParamsHoldLogEnd()) {
+            if (blackboxState != BLACKBOX_STATE_PAUSED && blackboxParamsHoldLogEnd()) {
                 break;
             }
             blackboxParamsEnd();
@@ -1920,8 +1920,7 @@ void blackboxLogEvent(FlightLogEvent event, flightLogEventData_t *data)
     case FLIGHT_LOG_EVENT_CUSTOM_STRING:
         length = strlen(data->string.buffer);
         blackboxWrite(length);
-        for (int i = 0; i < length; i++)
-            blackboxWrite(data->string.buffer[i]);
+        blackboxWriteString(data->string.buffer);
         break;
     case FLIGHT_LOG_EVENT_LOGGING_RESUME:
         blackboxWriteUnsignedVB(data->loggingResume.logIteration);

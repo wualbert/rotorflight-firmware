@@ -1,118 +1,111 @@
-# Blackbox parameter journal: flashing and testing on a helicopter
+# Blackbox parameter journal: hardware bench handoff
 
-This fork (branch `blackbox-param-journal`, on Rotorflight 4.6.0 `118e912`) makes every blackbox log carry the exact
-parameter values that produced each frame, as ArduPilot (PARM) and PX4 (ULog parameter messages) do:
+The bench candidate includes the audit corrections in [Blackbox_Params_Audit.md](Blackbox_Params_Audit.md),
+based on RF-4.6.x `53fd0637e`. It preserves Rotorflight 4.6 controller behavior; optional changes c1–c6 are excluded.
+Software evidence, exact source revision, target binaries and SHA-256 hashes are in the validation package.
+Use those local artifacts. The earlier prerelease assets are stale.
 
-- **Header snapshot.** At the start of each log: every tracked setting (30 parameter groups, all 6 PID profiles and all
-  6 rate profiles), the profile indices, boot-time values that differ from the stored ones, and a line count + hash.
-- **Per frame.** Four new slow-frame fields: `pidProfile`, `rateProfile` (0-5), `armed`, `paramSeq`.
-- **Change journal.** Every change while a log is open (MSP / Lua / Configurator writes, adjustments, profile switches,
-  EEPROM load/save, CMS, trims) and every change between two logs of one boot, as event-101 (`CUSTOM_STRING`) records
-  with the exact frame and loop tick, old and new value, a sequence number and a CRC. Lost records are always detected.
-- **No change to flight behaviour.** Values are applied exactly when and how stock 4.6.0 applies them.
+`blackbox_params` supports OFF, CHANGES and FULL; this candidate defaults to FULL. OFF preserves the stock header
+and frame format. Blackbox 2.3.0 decodes the new logs, but does not interpret the parameter history.
+The current repository's `tools/autotune/param_log.cjs` performs the history checks.
 
-Setting: `blackbox_params = OFF | CHANGES | FULL` (default `FULL`). `OFF` writes logs in the stock 4.6.0 format.
-Design: [`Blackbox_Params_Spec.md`](Blackbox_Params_Spec.md).
+Docker validation is complete as recorded in the report. The following work requires the physical boards.
+Hardware timing, storage throughput and stack headroom are acceptance measurements, not inferred software results.
 
-Status: unit tests (32), static audit of every writer, and SITL end-to-end tests pass (47,476 per-frame value checks
-against ground truth, 0 mismatches). **Not yet run on hardware.** Do the bench test below before any flight.
+## 1. Artifacts and physical setup
 
-## 1. Build
+Use STM32G47X for the Matek G474 heli (`MTKS-MATEKG474HELI`) and STM32F7X2 for the NEXUS F7 (`RDMS-NEXUS_F7`).
+Match the detected board before loading its MCU HEX. Keep the normal candidate, profiling candidate and stock
+baseline together with the manifest. Do not add `FLASH_CONFIG_ERASE=yes`.
 
-```sh
-git switch blackbox-param-journal
-make arm_sdk_install          # once
-make STM32G47X                # Matek G474 heli (MTKS-MATEKG474HELI) -> obj/rotorflight_4.6.0_STM32G47X.hex
-make STM32F7X2                # RDMS NEXUS_F7                       -> obj/rotorflight_4.6.0_STM32F7X2.hex
-```
+Remove main and tail blades. Disconnect motor power. Check that servos and linkages can move without obstruction.
+Use the existing receiver and storage device so the test exercises the intended MSP/Lua transport and flash chip.
+The optional profiling build requires the usual SWD debugger for its counters. It includes debug symbols and the
+existing stack-check task; normal binaries omit that instrumentation.
 
-Do not add `FLASH_CONFIG_ERASE=yes` (that marker makes the board erase its configuration). Release hex files are
-attached to the GitHub pre-release of this branch.
+## 2. Preserve and measure the stock configuration
 
-## 2. Back up (each helicopter, on its current firmware)
+For each board, download existing blackbox logs before erasing storage. Save `diff all` and `dump all`, including board
+resources. Record `version`, `status`, `tasks`, logging settings and PID/filter denominators. Record a stock bench log
+with the same configuration and the operations in section 4. Keep EEPROM-save stalls as a separate measurement.
 
-1. Download the blackbox flash (Configurator Blackbox tab, or `tools/flash_read.py` in the viewer repository).
-2. CLI tab: `diff all` -> Save to File. Then `dump all` -> Save to File (the fallback: it has every resource line).
-3. Write down `tasks` and `status` output (CPU load, PID loop time) to compare after the flash.
+Use identical logging fields, sample rate, receiver update rate and storage state for candidate comparisons.
+Measure the stock arm-to-first-frame interval and frame interval distribution; no fixed historical estimate replaces
+this board's baseline.
 
-## 3. Flash with Rotorflight Configurator 2.3.0 (keeps the configuration)
+## 3. Flash and verify
 
-1. Options tab: enable **Show advanced firmware flashing options** (otherwise "Full chip erase" is forced on).
-2. Connect, open Firmware Flasher, click **Detect**. The board list must show `MTKS-MATEKG474HELI` (Fireball) or
-   `RDMS-NEXUS_F7` (Gaui). Be online: the Configurator downloads the board configuration and inserts it into the hex.
-3. **Untick Full chip erase.**
-4. **Load Firmware [Local]** -> the matching hex (`STM32G47X` for the Matek, `STM32F7X2` for the NEXUS). Do not change
-   the board list after this.
-5. **Flash Firmware.**
+In Rotorflight Configurator, enable advanced flashing options. Detect the board and retain its exact board selection
+so its custom defaults are included. Disable full-chip erase, load the matching local HEX and flash it.
+After reboot, verify `version` against the manifest, `defaults show`, `diff all`, `status` and `tasks`.
+Check `blackbox_mode`, `blackbox_device`, `blackbox_params`, PID/filter denominators and board resources.
 
-If the configuration was wiped anyway (chip erase left on): the board boots on its board defaults; paste the `diff all`
-backup and `save`. If the board defaults are missing too (no board was selected), paste `dump all` and `save`.
+If settings were erased, restore the saved `diff all`; use `dump all` if board defaults or resources are missing.
+Confirm the resulting configuration before arming. Do not substitute a different board target.
 
-## 4. Check after the flash (CLI)
+## 4. Functional bench sequence
 
-| Command | Expected |
-|---|---|
-| `version` | `Rotorflight 4.6.0 (<hash of this branch>)` |
-| `defaults show` | starts with `## Rotorflight Custom Defaults` and the right board |
-| `get blackbox_params` | `FULL` |
-| `diff all` | the backup, apart from the version line |
-| `get blackbox_mode`, `get blackbox_device` | as before (ARMED, SPIFLASH) |
-| `tasks` | PID loop and total CPU close to the numbers from step 2.3 |
+First use the normal build in OFF, then CHANGES, then FULL. Record the original value of every setting changed and
+restore it at the end. Download each run before deliberate storage-full or erase tests.
 
-## 5. Bench test (blades off, motor unpowered or held at idle)
+1. Arm and log for 10 seconds. Change yaw P by one using the receiver's Lua/MSP path and save.
+2. Select PID profiles with both the receiver adjustment switch and the Lua page. Exercise rate-profile selection too.
+3. Disarm, change yaw P back, save and re-arm within the configured grace period. This must remain one log.
+4. Disarm and wait beyond the grace period. Change roll P by one, save, arm and record a new log.
+5. Power-cycle and read back the saved values and active profiles. Record another log.
+6. Repeat ordinary changes, saves and profile switches ten times. Exercise header-time changes, CMS and CLI entry
+   during GRACE. CLI termination may leave a valid prefix without LOG_END.
+7. Test SWITCH logging stop/restart. The stopped log must close and must not resume when the switch is turned on again.
+8. On separate runs, exercise full storage, erase/restart and abrupt power loss. If serial logging is used, test 115200
+   baud (FULL falls back to CHANGES) and the intended high baud rate.
 
-Erase the blackbox flash first, then do each step and write down the time from your watch or the radio:
-
-1. Arm. Wait 10 s.
-2. While armed, with the Lua script: change yaw P by +1 and **Save**.
-3. While armed: switch PID profile with your profile switch; then select another PID profile on a Lua page.
-4. Disarm. Within 2 s, change yaw P by -1 with the Lua and Save. Re-arm within 1 s of the save. Wait 10 s. Disarm.
-5. Wait 10 s (the log ends 5 s after the disarm). Change roll P by +1, Save, arm again (a new log). Wait 10 s. Disarm.
-6. Power cycle. Arm, wait 10 s, disarm (a log after a reboot).
-7. Optional: pull the battery while armed and recording (the last records must show as lost, not as missing).
-
-Download the log and decode it with the viewer repository (`rotorflight-blackbox`):
+Decode each file in the viewer repository:
 
 ```sh
-node tools/autotune/param_log.cjs RTFL_BLACKBOX_LOG_<...>.BBL
+node tools/autotune/param_log.cjs <downloaded-log.BBL>
 ```
 
-Pass criteria, for each log:
+Normal FULL logs require a complete header, valid header hash, zero CRC errors, zero unexplained sequence gaps and
+successful self-test. Verify each setting's old/new values, profile index and operation source. Re-arm changes must
+appear in the same log; between-log changes must precede the first frame of the next log. Copy/reset operations may
+leave stored values pending until their loader runs; the viewer must not claim they already changed controller output.
+OFF must have no parameter section, journal strings or additional slow fields.
 
-- `Param log 1 FULL, header complete`, `0 gaps`, `0 CRC errors`, `self-test ok`.
-- Every save of steps 2-5 is a `C` record with source `m.<command>` and the right key, old and new value
-  (`p<k>.yaw_p_gain=81<80` and so on; `k` is the 0-based PID profile).
-- Step 3: the profile changes show in the epochs ("PID profile N") with no `unknown`.
-- Step 4: one log with two arms; the change in the grace period is a `C` record before the re-arm.
-- Step 5: the new log starts with `v` records (changes between logs) and its values are exact from frame 0.
-- Step 7 (if done): the last frames are `unknown, lost`; nothing is silently wrong.
-- No `u` or `y` records (they mean a write that no hook saw, or a buffer overflow).
+For intentional loss, require conservative unknown/lost intervals where sequence/frame evidence shows missing records.
+A write after the last complete frame can leave no evidence, so not every power loss can produce a trailing-loss flag.
+A corrupted or truncated header must not establish a complete configuration. Investigate unexpected `u`, `y`, `L` or
+unsent records in normal runs; interval recovery is not an exact operation timestamp.
 
-Timing gates before the first flight (spec section 6.6):
+## 5. Timing, storage and stack gates
 
-- `tasks`: PID loop and gyro task times within noise of stock; no new late tasks.
-- In the viewer, the frame interval distribution matches a stock log of the same setup (apart from the known 26 ms
-  (F7) / 71 ms (G474) stall 0.5 s after a disarm, which stock 4.6.0 also has: the delayed EEPROM save).
-- Arm to first frame: stock is about 230 ms; FULL adds about 200-250 ms (no data in that window). If that matters,
-  use `set blackbox_params = CHANGES` (about +20 ms; values that never change are then only in the classic header).
+Run the same cases with the matching profiling HEX. Attach the debugger using its matching ELF and source
+`tools/validation/profiles.gdb`. Read the actual `SystemCoreClock`. Counter indices are HeaderTick, WriteHeader,
+Running, AfterFrame, OpBegin, OpEnd and OperationSpan. The last includes the writer and loaders; measure EEPROM saves
+separately. Reset counters while disarmed between scenarios. Do not halt the MCU during a timing capture.
 
-## 6. First flight
+The profile build exposes `bbpFlashfsDroppedBytes` and enables `USE_STACK_CHECK`; `status` reports stack allocation
+and used bytes. Record these after the worst burst and header cases. Profile instrumentation adds work, so also compare
+normal-build `tasks` and logged timing with stock. Linker free RAM is not a stack measurement.
 
-Hover only, normal profile, then land, disarm and wait 10 s. Decode the log as in section 5. Compare a stock log of
-the same pack for loop timing and for missing frames.
+Apply specification sections 3.12 and 6.6:
 
-## 7. Roll back
+- No refused flash bytes in normal operation, no new late PID tasks, and no unexplained frame gaps.
+- Ordinary operation maximum: 100 microseconds on G474 and 80 on F722. Record begin/end hooks and the total span.
+- Idle journal work: at most 3 microseconds per logged iteration.
+- Capture step: at most 10 microseconds on G474 and 8 on F722. Header call: at most 30 and 25, respectively.
+- Measure the complete AfterFrame maximum including formatting and device work, plus scheduler/flush time. It must
+  fit the configured PID deadline without introducing late tasks; a host estimate is not an acceptance result.
+- FULL arm-to-first-frame increase: at most 160 milliseconds on Fireball and 40 on Gaui relative to their stock runs.
+- Record stack high-water and remaining allocation under the largest configuration bursts. Any stack exhaustion fails.
 
-- Keeping the settings: build `release/4.6.0` (`git switch --detach release/4.6.0 && make STM32G47X`) and flash it
-  as in section 3. Official 4.6.0 ignores the extra configuration byte.
-- Official route: Load Firmware [Online], 4.6.0, board selected. This always erases the configuration; restore the
-  `diff all` backup. A `diff all` or `dump all` made on this fork contains `set blackbox_params = ...` (always in
-  `dump all`): delete that line first, or stock 4.6.0 refuses to `save` ("INVALID NAME").
+Save logs, counters, task/status output and the exact binary hash with the bench results. A failing gate requires a fix
+and repetition of its affected software and hardware checks. Flight validation starts only after these gates pass.
 
-## 8. Known limits
+## 6. Rollback and handoff
 
-- A UART blackbox logger below 1 Mbaud gets `CHANGES` instead of `FULL` (the header would take seconds).
-- A write while a log is open costs an estimated 70-90 µs in the MSP task on the G474 (measure with `tasks`).
-- More than about 1 KB of changes between two logs overflows the record buffer before the log starts; those groups
-  are then "unknown" until their resync record, a few frames later.
-- ESC-internal settings, radio settings and mechanics are not in the log.
+Flash the matching stock baseline or official 4.6.0 with the correct board defaults. Restore the stock backup if needed.
+A dump made by the candidate includes `set blackbox_params`; remove that unsupported line before restoring to stock.
+Confirm resources, configuration, receiver, logging and version after rollback.
+
+The software package does not authorize a flight or claim a hardware pass. Submit the PR with the recorded software
+results and the completed physical bench measurements; keep missing measurements explicitly pending.

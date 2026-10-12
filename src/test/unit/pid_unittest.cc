@@ -26,9 +26,11 @@ float throttle;
 
 // Dummies
 extern "C" {
+#include "blackbox/blackbox_params.h"
 #include "pg/pid.h"
 #include "sensors/gyro.h"
 
+void blackboxParamsApplied(bbpLoader_e, int) {}
 bool gyroOverflowDetected(void) { return false; }
 void beeperConfirmationBeeps(uint8_t) {}
 float getThrottle(void) { return throttle; }
@@ -57,6 +59,9 @@ extern "C" {
 // Fixed 1000Hz
 gyro_t gyro = {.targetLooptime = 1000000 / 1000};
 pidProfile_t *mockPidProfile = pidProfilesMutable(0);
+pidProfile_t *currentPidProfile = pidProfilesMutable(0);
+uint8_t getCurrentPidProfileIndex(void) { return 0; }
+void changePidProfile(uint8_t) {}
 
 float getSetpoint(int axis) { return g_mock->getDeflection(axis) * 360; }
 float getDeflection(int axis) { return g_mock->getDeflection(axis); }
@@ -109,7 +114,7 @@ TEST_F(PIDTestBase, Mode0)
 {
     mockPidProfile->pid_mode = 0;
     mockPidProfile->pid[0].F = 1;
-    pidInitProfile(mockPidProfile);
+    pidLoadProfile(mockPidProfile);
 
     PIDIO input;
     for (int i = 0; i < 100; i++) {
@@ -148,7 +153,7 @@ TEST_F(PIDFBTest, B)
     mockPidProfile->pid[0].F = 0;
     mockPidProfile->pid[0].B = 100;
     mockPidProfile->bterm_cutoff[0] = 30;
-    pidInitProfile(mockPidProfile);
+    pidLoadProfile(mockPidProfile);
 
     PIDIO input;
     for (int i = 0; i < 500; i++) {

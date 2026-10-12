@@ -103,6 +103,10 @@
 #define BBP_TRACKED_ENTRY(pgn, var, flags)  { (pgn), sizeof(var), (flags) },
 #define BBP_BOOT_SIZE(pgn, var, flags)      + (((flags) & BBP_PG_BOOT) ? BBP_ALIGNED(sizeof(var)) : 0)
 #define BBP_TRACKED_SIZE(pgn, var, flags)   + BBP_ALIGNED(sizeof(var))
+#define BBP_COVERAGE_SIZE(pgn, var, flags)  + ((sizeof(var) + 7) / 8)
+#define BBP_SIZE_CHECK(pgn, var, flags)     STATIC_ASSERT(sizeof(var) <= BBP_PG_MAX_BYTES, bbp_size_##var);
+
+BBP_TRACKED_PG_LIST(BBP_SIZE_CHECK)
 
 const bbpTrackedPg_t bbpTrackedPgs[] = {
     BBP_TRACKED_PG_LIST(BBP_TRACKED_ENTRY)
@@ -113,6 +117,7 @@ STATIC_ASSERT(BBP_TRACKED <= 32, bbp_tracked_mask);     // bit masks of tracked 
 
 // Sized for every group of the list, also for a group that is not in this build
 uint8_t bbpBootCopy[0 BBP_TRACKED_PG_LIST(BBP_BOOT_SIZE)] __attribute__((aligned(4)));
+uint8_t bbpCoverage[0 BBP_TRACKED_PG_LIST(BBP_COVERAGE_SIZE)];
 
 uint16_t bbpBootOffset(int t)
 {
@@ -286,13 +291,13 @@ void bbpTablesInit(void)
             for (const pgn_t *pgn = loaderRegions[l]; *pgn; pgn++) {
                 const int t = bbpTrackedIndex(*pgn);
                 if (t >= 0) {
-                    mask |= BIT(t);
+                    mask |= BBP_BIT(t);
                 }
             }
         } else {
             for (int t = 0; t < BBP_TRACKED; t++) {
                 if (bbpPg[t].reg) {
-                    mask |= BIT(t);
+                    mask |= BBP_BIT(t);
                 }
             }
         }
